@@ -43,6 +43,38 @@ import pandas as pd
 
 AUTOR = "PIEXTRACT BY: ALEJANDRO BURELO SANCHEZ"
 
+# Excel (.xlsx) soporta como maximo 1,048,576 filas por hoja (incluyendo el
+# encabezado). Dejamos un margen para el encabezado de cada hoja.
+FILAS_MAX_POR_HOJA = 1_048_575
+
+
+def guardar_excel_multi_hoja(df: pd.DataFrame, salida: str, progreso=None, paso_base: int = 0) -> int:
+    """
+    Guarda el DataFrame en un .xlsx. Si supera el limite de filas de una
+    sola hoja de Excel, lo reparte automaticamente en "Datos1", "Datos2",
+    etc. Devuelve la cantidad de hojas escritas.
+    """
+    total_filas = len(df)
+
+    if total_filas <= FILAS_MAX_POR_HOJA:
+        df.to_excel(salida, index=False, sheet_name="Datos")
+        return 1
+
+    n_hojas = -(-total_filas // FILAS_MAX_POR_HOJA)  # ceil sin importar math
+    with pd.ExcelWriter(salida, engine="openpyxl") as writer:
+        for i in range(n_hojas):
+            ini = i * FILAS_MAX_POR_HOJA
+            fin = ini + FILAS_MAX_POR_HOJA
+            trozo = df.iloc[ini:fin]
+            nombre_hoja = f"Datos{i + 1}"
+            if progreso:
+                progreso.actualizar(
+                    paso_base, f"Guardando hoja {i + 1}/{n_hojas} ({len(trozo)} filas)..."
+                )
+            trozo.to_excel(writer, index=False, sheet_name=nombre_hoja)
+
+    return n_hojas
+
 
 class VentanaProgreso:
     """Ventana simple con barra de progreso verde y el credito del autor
@@ -256,7 +288,14 @@ def main():
     progreso.actualizar(total_pasos - 1, "Guardando archivo combinado...")
 
     if salida.lower().endswith(".xlsx"):
-        resultado.to_excel(salida, index=False)
+        n_hojas = guardar_excel_multi_hoja(
+            resultado, salida, progreso=progreso, paso_base=total_pasos - 1
+        )
+        if n_hojas > 1:
+            print(
+                f"Datos repartidos en {n_hojas} hojas "
+                f"(limite de Excel: {FILAS_MAX_POR_HOJA} filas por hoja)."
+            )
     else:
         resultado.to_csv(salida, index=False)
 
