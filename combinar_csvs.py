@@ -2,6 +2,8 @@
 Combina varios archivos CSV (formato Timestamp / Valor / Tag) en una sola tabla,
 alineados por Timestamp, rellenando los huecos con forward-fill y luego backward-fill.
 
+PIEXTRACT - by Alejandro Burelo Sanchez
+
 Requisitos:
     pip install pandas openpyxl
 
@@ -12,13 +14,16 @@ Dos modos de uso:
 
   2) MODO SILENCIOSO / DESATENDIDO (para llamarlo desde VBA, un .exe, etc.):
          python combinar_csvs.py "C:\\ruta\\a\\la\\carpeta\\con\\csv"
-     - No muestra ningún diálogo.
+     - No pregunta carpeta ni nombre de salida.
      - Genera "COMBINADO.xlsx" dentro de esa misma carpeta (sobrescribiendo
        si ya existe).
      - Al terminar abre el archivo automáticamente (os.startfile, Windows).
      - Si algo falla, el error queda registrado en "COMBINADO_error.log"
-       dentro de la misma carpeta (útil porque un .exe compilado con
-       --noconsole no muestra ninguna ventana de consola).
+       dentro de la misma carpeta.
+
+En ambos modos se muestra una ventana con barra de progreso (verde) para
+que se vea que el proceso está trabajando, ya que el .exe se compila con
+--noconsole y de otra forma corre totalmente invisible.
 
 Soporta dos formatos de CSV:
   1) Un solo tag por archivo: columnas Timestamp, Valor, Tag (en ese orden).
@@ -31,13 +36,87 @@ import glob
 import os
 import sys
 import traceback
+import tkinter as tk
+from tkinter import filedialog, messagebox, ttk
+
 import pandas as pd
+
+AUTOR = "PIEXTRACT BY: ALEJANDRO BURELO SANCHEZ"
+
+
+class VentanaProgreso:
+    """Ventana simple con barra de progreso verde y el credito del autor
+    arriba. Se actualiza llamando a .actualizar(valor, mensaje) y se cierra
+    con .cerrar(). No usa hilos: hay que llamar a .actualizar(...) seguido
+    para que la ventana se refresque (Tkinter sin mainloop propio)."""
+
+    def __init__(self, total: int):
+        self.total = max(total, 1)
+        self.root = tk.Tk()
+        self.root.title("PIEXTRACT")
+        self.root.geometry("440x130")
+        self.root.resizable(False, False)
+        self.root.attributes("-topmost", True)
+
+        tk.Label(
+            self.root,
+            text=AUTOR,
+            font=("Segoe UI", 9, "bold"),
+        ).pack(pady=(12, 6))
+
+        self.label_estado = tk.Label(
+            self.root, text="Iniciando...", font=("Segoe UI", 9)
+        )
+        self.label_estado.pack(pady=(0, 6))
+
+        estilo = ttk.Style()
+        try:
+            estilo.theme_use("default")
+        except Exception:
+            pass
+        estilo.configure(
+            "Verde.Horizontal.TProgressbar",
+            troughcolor="#e0e0e0",
+            background="#2ecc71",
+            bordercolor="#2ecc71",
+            lightcolor="#2ecc71",
+            darkcolor="#2ecc71",
+            thickness=18,
+        )
+
+        self.barra = ttk.Progressbar(
+            self.root,
+            style="Verde.Horizontal.TProgressbar",
+            orient="horizontal",
+            length=400,
+            mode="determinate",
+            maximum=self.total,
+        )
+        self.barra.pack(pady=4)
+
+        self._refrescar()
+
+    def actualizar(self, valor: int, mensaje: str = ""):
+        self.barra["value"] = min(valor, self.total)
+        if mensaje:
+            self.label_estado.config(text=mensaje)
+        self._refrescar()
+
+    def _refrescar(self):
+        try:
+            self.root.update_idletasks()
+            self.root.update()
+        except Exception:
+            pass
+
+    def cerrar(self):
+        try:
+            self.root.destroy()
+        except Exception:
+            pass
 
 
 def elegir_carpeta() -> str:
-    import tkinter as tk
-    from tkinter import filedialog
-
     root = tk.Tk()
     root.withdraw()
     root.attributes("-topmost", True)
@@ -47,9 +126,6 @@ def elegir_carpeta() -> str:
 
 
 def elegir_archivo_salida(carpeta_inicial: str) -> str:
-    import tkinter as tk
-    from tkinter import filedialog
-
     root = tk.Tk()
     root.withdraw()
     root.attributes("-topmost", True)
@@ -75,9 +151,6 @@ def mostrar_error(mensaje: str, carpeta: str | None = None, modo_silencioso: boo
         except Exception:
             pass
     else:
-        import tkinter as tk
-        from tkinter import messagebox
-
         root = tk.Tk()
         root.withdraw()
         messagebox.showerror("Error", mensaje)
@@ -139,21 +212,30 @@ def main():
     for f in archivos_csv:
         print(f"  - {os.path.basename(f)}")
 
+    # Total de pasos para la barra: 1 por archivo leido + 1 para combinar + 1 para guardar
+    total_pasos = len(archivos_csv) + 2
+    progreso = VentanaProgreso(total_pasos)
+
     todos_los_dfs = []
-    for f in archivos_csv:
+    for idx, f in enumerate(archivos_csv, start=1):
+        nombre = os.path.basename(f)
+        progreso.actualizar(idx - 1, f"Leyendo {nombre} ({idx}/{len(archivos_csv)})...")
         try:
             dfs = leer_csv_como_bloques(f)
             todos_los_dfs.extend(dfs)
-            print(f"  {os.path.basename(f)}: {len(dfs)} tag(s) encontrados")
+            print(f"  {nombre}: {len(dfs)} tag(s) encontrados")
         except Exception as e:
-            print(f"  Error leyendo {os.path.basename(f)}: {e}")
+            print(f"  Error leyendo {nombre}: {e}")
+        progreso.actualizar(idx, f"Leido {nombre}")
 
     if not todos_los_dfs:
+        progreso.cerrar()
         msg = "No se encontraron datos válidos (Timestamp/Valor/Tag) en los CSV."
         print(msg)
         mostrar_error(msg, carpeta, modo_silencioso)
         os._exit(1)
 
+    progreso.actualizar(len(archivos_csv) + 1, "Combinando datos (merge por Timestamp)...")
     resultado = todos_los_dfs[0]
     for d in todos_los_dfs[1:]:
         resultado = resultado.merge(d, on="Timestamp", how="outer")
@@ -164,17 +246,24 @@ def main():
     if modo_silencioso:
         salida = os.path.join(carpeta, "COMBINADO.xlsx")
     else:
+        progreso.cerrar()
         salida = elegir_archivo_salida(carpeta)
         if not salida:
             print("No se guardó ningún archivo.")
-            return
+            os._exit(0)
+        progreso = VentanaProgreso(1)
+
+    progreso.actualizar(total_pasos - 1, "Guardando archivo combinado...")
 
     if salida.lower().endswith(".xlsx"):
         resultado.to_excel(salida, index=False)
     else:
         resultado.to_csv(salida, index=False)
 
+    progreso.actualizar(total_pasos, "Listo.")
     print(f"Archivo combinado guardado en: {salida}")
+
+    progreso.cerrar()
 
     # Abrir el archivo final automáticamente (Windows)
     try:
@@ -183,9 +272,6 @@ def main():
         pass  # si no es Windows o falla, simplemente no lo abre
 
     if not modo_silencioso:
-        import tkinter as tk
-        from tkinter import messagebox
-
         root = tk.Tk()
         root.withdraw()
         messagebox.showinfo("Listo", f"Archivo combinado guardado en:\n{salida}")
