@@ -34,6 +34,7 @@ Soporta dos formatos de CSV:
 
 import glob
 import os
+import re
 import sys
 import time
 import traceback
@@ -238,6 +239,36 @@ class VentanaProgreso:
             pass
 
 
+def obtener_ruta_salida_disponible(carpeta: str) -> str:
+    """
+    Devuelve una ruta de salida lista para escribir dentro de 'carpeta'.
+    Empieza probando "COMBINADO.xlsx"; si ese archivo existe y esta
+    BLOQUEADO (por ejemplo porque alguien lo tiene abierto en Excel),
+    prueba "COMBINADO2.xlsx", "COMBINADO3.xlsx", etc. hasta encontrar uno
+    que se pueda escribir. Si el archivo existe pero NO esta bloqueado,
+    lo reusa igual (se sobrescribe, comportamiento de siempre).
+    """
+    intento = 0
+    while True:
+        nombre = "COMBINADO.xlsx" if intento == 0 else f"COMBINADO{intento + 1}.xlsx"
+        candidato = os.path.join(carpeta, nombre)
+
+        if not os.path.exists(candidato):
+            return candidato
+
+        # El archivo ya existe: probamos si esta bloqueado intentando
+        # abrirlo para escritura sin truncarlo (no modifica el contenido).
+        try:
+            with open(candidato, "r+b"):
+                pass
+            return candidato  # no estaba bloqueado -> lo sobrescribimos
+        except (PermissionError, OSError):
+            intento += 1
+            if intento > 50:
+                # Ultimo recurso para no quedar en loop infinito
+                return os.path.join(carpeta, f"COMBINADO_{int(time.time())}.xlsx")
+
+
 def elegir_carpeta() -> str:
     root = tk.Tk()
     root.withdraw()
@@ -279,6 +310,100 @@ def mostrar_error(mensaje: str, carpeta: str | None = None, modo_silencioso: boo
         root.destroy()
 
 
+# ============================================================
+# Parseo rapido de Timestamps.
+# PI (via v.TimeStamp.LocalDate en el .bas) devuelve la fecha como texto
+# con el formato del idioma/configuracion regional de Windows -- puede
+# venir con nombre de mes en ingles ("25-Aug-26 10:00:00"), en espanol
+# ("25-ago-26 10:00:00" o "25-ago.-26 10:00:00"), o en formato numerico
+# ("25/08/2026 10:00:00"). Si no probamos un formato exacto, pandas cae a
+# un parser fila-por-fila ~20x mas lento con datasets grandes. Por eso:
+# 1) normalizamos nombres de mes (ingles/espanol) a numero de 2 digitos,
+#    para no depender de que el locale del proceso coincida con el del
+#    texto (evita fallas raras de referencia con %b de Python).
+# 2) detectamos el formato exacto UNA SOLA VEZ (con una muestra chica) y
+#    lo reusamos para todo el resto -- muchisimo mas rapido.
+# ============================================================
+_MESES_A_NUMERO = {
+    "ene": "01", "jan": "01",
+    "feb": "02",
+    "mar": "03",
+    "abr": "04", "apr": "04",
+    "may": "05",
+    "jun": "06",
+    "jul": "07",
+    "ago": "08", "aug": "08",
+    "sep": "09", "sept": "09", "set": "09",
+    "oct": "10",
+    "nov": "11",
+    "dic": "12", "dec": "12",
+}
+_PATRON_MES = re.compile(
+    r"(?i)\b(" + "|".join(sorted(_MESES_A_NUMERO.keys(), key=len, reverse=True)) + r")\.?\b"
+)
+
+_FORMATOS_FECHA_CANDIDATOS = [
+    "%d-%m-%y %H:%M:%S",
+    "%d-%m-%Y %H:%M:%S",
+    "%d/%m/%Y %H:%M:%S",
+    "%d/%m/%y %H:%M:%S",
+    "%m/%d/%Y %I:%M:%S %p",
+    "%m/%d/%y %I:%M:%S %p",
+    "%Y-%m-%d %H:%M:%S",
+]
+
+# Cache global: una vez detectado el formato para esta corrida, se reusa
+# para todos los archivos siguientes (todos vienen de la misma extraccion
+# de PI, mismo locale).
+_formato_fecha_cache: str | None = None
+
+
+def _normalizar_nombres_de_mes(serie_texto: pd.Series) -> pd.Series:
+    def _reemplazar(m: "re.Match[str]") -> str:
+        return _MESES_A_NUMERO[m.group(1).lower()]
+    return serie_texto.astype(str).str.replace(_PATRON_MES, _reemplazar, regex=True)
+
+
+def _detectar_formato(muestra: pd.Series) -> str | None:
+    muestra = muestra.dropna()
+    if len(muestra) == 0:
+        return None
+    muestra = muestra.head(300)
+    for fmt in _FORMATOS_FECHA_CANDIDATOS:
+        try:
+            parsed = pd.to_datetime(muestra, format=fmt, errors="coerce")
+        except Exception:
+            continue
+        if parsed.notna().mean() >= 0.95:
+            return fmt
+    return None
+
+
+def parsear_timestamps_rapido(serie_original: pd.Series) -> pd.Series:
+    """Convierte una columna de texto de fechas a datetime, usando el
+    formato detectado/cacheado cuando es posible (rapido) y cayendo al
+    parser generico de pandas solo si hace falta (siempre correcto,
+    aunque mas lento)."""
+    global _formato_fecha_cache
+
+    normalizada = _normalizar_nombres_de_mes(serie_original)
+
+    if _formato_fecha_cache:
+        parsed = pd.to_datetime(normalizada, format=_formato_fecha_cache, errors="coerce")
+        # Si el formato cacheado deja de servir (archivo con otro formato),
+        # volvemos a detectar en vez de devolver puros NaT.
+        if len(normalizada.dropna()) == 0 or parsed.notna().mean() >= 0.90:
+            return parsed
+
+    fmt_detectado = _detectar_formato(normalizada)
+    if fmt_detectado:
+        _formato_fecha_cache = fmt_detectado
+        return pd.to_datetime(normalizada, format=fmt_detectado, errors="coerce")
+
+    # Fallback: parser generico de pandas (mas lento, pero siempre funciona)
+    return pd.to_datetime(normalizada, errors="coerce")
+
+
 def leer_csv_como_bloques(path: str) -> list[pd.DataFrame]:
     """
     Lee un CSV y devuelve una lista de DataFrames (Timestamp, <NombreTag>),
@@ -298,7 +423,7 @@ def leer_csv_como_bloques(path: str) -> list[pd.DataFrame]:
             tag_name = bloque["Tag"].dropna().iloc[0]
             bloque = bloque[["Timestamp", "Valor"]].dropna()
             bloque.columns = ["Timestamp", tag_name]
-            bloque["Timestamp"] = pd.to_datetime(bloque["Timestamp"], errors="coerce")
+            bloque["Timestamp"] = parsear_timestamps_rapido(bloque["Timestamp"])
             bloque = bloque.dropna(subset=["Timestamp"]).drop_duplicates(subset=["Timestamp"])
             if len(bloque) > 0:
                 dfs.append(bloque)
@@ -366,7 +491,9 @@ def main():
     resultado = resultado.ffill().bfill()
 
     if modo_silencioso:
-        salida = os.path.join(carpeta, "COMBINADO.xlsx")
+        salida = obtener_ruta_salida_disponible(carpeta)
+        if os.path.basename(salida) != "COMBINADO.xlsx":
+            print(f"COMBINADO.xlsx estaba bloqueado/abierto, se usa: {os.path.basename(salida)}")
     else:
         progreso.cerrar()
         salida = elegir_archivo_salida(carpeta)
