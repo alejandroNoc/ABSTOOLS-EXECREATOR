@@ -35,11 +35,13 @@ Soporta dos formatos de CSV:
 import glob
 import os
 import sys
+import time
 import traceback
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 import pandas as pd
+from openpyxl import Workbook
 
 AUTOR = "PIEXTRACT BY: ALEJANDRO BURELO SANCHEZ"
 
@@ -47,32 +49,71 @@ AUTOR = "PIEXTRACT BY: ALEJANDRO BURELO SANCHEZ"
 # encabezado). Dejamos un margen para el encabezado de cada hoja.
 FILAS_MAX_POR_HOJA = 1_048_575
 
+# Cada cuanto tiempo (segundos) se refresca la ventana mientras se escriben
+# filas. No es un porcentaje fijo: el avance se ve libre/continuo, y esto
+# solo evita redibujar la ventana mas seguido de lo que el ojo puede ver
+# (lo cual ademas frenaria muchisimo la escritura con datasets grandes).
+INTERVALO_REFRESCO_SEGUNDOS = 0.05
 
-def guardar_excel_multi_hoja(df: pd.DataFrame, salida: str, progreso=None, paso_base: int = 0) -> int:
+
+def guardar_excel_multi_hoja(df: pd.DataFrame, salida: str, progreso=None, paso_base: float = 0) -> int:
     """
-    Guarda el DataFrame en un .xlsx. Si supera el limite de filas de una
-    sola hoja de Excel, lo reparte automaticamente en "Datos1", "Datos2",
-    etc. Devuelve la cantidad de hojas escritas.
+    Guarda el DataFrame en un .xlsx escribiendo fila por fila con openpyxl
+    (modo write_only, rapido incluso con millones de filas). Si supera el
+    limite de una sola hoja de Excel, lo reparte automaticamente en
+    "Datos1", "Datos2", etc. El progreso de cada hoja se reporta en la
+    barra celeste de forma libre (no por saltos de 10%), refrescando la
+    ventana varias veces por segundo mientras escribe. Devuelve la
+    cantidad de hojas escritas.
     """
-    total_filas = len(df)
+    total_filas_todas = len(df)
 
-    if total_filas <= FILAS_MAX_POR_HOJA:
-        df.to_excel(salida, index=False, sheet_name="Datos")
-        return 1
+    if total_filas_todas <= FILAS_MAX_POR_HOJA:
+        chunks = [df]
+    else:
+        n_hojas_calc = -(-total_filas_todas // FILAS_MAX_POR_HOJA)  # ceil
+        chunks = [
+            df.iloc[i * FILAS_MAX_POR_HOJA:(i + 1) * FILAS_MAX_POR_HOJA]
+            for i in range(n_hojas_calc)
+        ]
 
-    n_hojas = -(-total_filas // FILAS_MAX_POR_HOJA)  # ceil sin importar math
-    with pd.ExcelWriter(salida, engine="openpyxl") as writer:
-        for i in range(n_hojas):
-            ini = i * FILAS_MAX_POR_HOJA
-            fin = ini + FILAS_MAX_POR_HOJA
-            trozo = df.iloc[ini:fin]
-            nombre_hoja = f"Datos{i + 1}"
+    n_hojas = len(chunks)
+    wb = Workbook(write_only=True)
+    filas_escritas_total = 0
+
+    if progreso:
+        progreso.mostrar_barra_hoja()
+
+    for idx, chunk in enumerate(chunks, start=1):
+        nombre_hoja = "Datos" if n_hojas == 1 else f"Datos{idx}"
+        ws = wb.create_sheet(title=nombre_hoja)
+        ws.append(list(chunk.columns))
+
+        if progreso:
+            valor_barra = paso_base + (filas_escritas_total / total_filas_todas)
+            progreso.actualizar(valor_barra, f"Guardando hoja {idx}/{n_hojas}...")
+
+        # NaN/NaT no son validos para openpyxl -> los pasamos a None (celda vacia)
+        chunk_seguro = chunk.astype(object).where(pd.notnull(chunk), None)
+        total_filas_hoja = len(chunk_seguro)
+        ultimo_refresco = 0.0
+
+        for i, fila in enumerate(chunk_seguro.itertuples(index=False, name=None), start=1):
+            ws.append(fila)
+            filas_escritas_total += 1
+
             if progreso:
-                progreso.actualizar(
-                    paso_base, f"Guardando hoja {i + 1}/{n_hojas} ({len(trozo)} filas)..."
-                )
-            trozo.to_excel(writer, index=False, sheet_name=nombre_hoja)
+                ahora = time.perf_counter()
+                if ahora - ultimo_refresco >= INTERVALO_REFRESCO_SEGUNDOS or i == total_filas_hoja:
+                    ultimo_refresco = ahora
+                    valor_barra = paso_base + (filas_escritas_total / total_filas_todas)
+                    progreso.actualizar(valor_barra)
+                    progreso.actualizar_hoja(i, total_filas_hoja)
 
+    if progreso:
+        progreso.ocultar_barra_hoja()
+
+    wb.save(salida)
     return n_hojas
 
 
@@ -86,7 +127,7 @@ class VentanaProgreso:
         self.total = max(total, 1)
         self.root = tk.Tk()
         self.root.title("PIEXTRACT")
-        self.root.geometry("440x130")
+        self.root.geometry("460x220")
         self.root.resizable(False, False)
         self.root.attributes("-topmost", True)
 
@@ -99,7 +140,7 @@ class VentanaProgreso:
         self.label_estado = tk.Label(
             self.root, text="Iniciando...", font=("Segoe UI", 9)
         )
-        self.label_estado.pack(pady=(0, 6))
+        self.label_estado.pack(pady=(0, 4))
 
         estilo = ttk.Style()
         try:
@@ -115,6 +156,15 @@ class VentanaProgreso:
             darkcolor="#2ecc71",
             thickness=18,
         )
+        estilo.configure(
+            "Celeste.Horizontal.TProgressbar",
+            troughcolor="#e0e0e0",
+            background="#5dade2",
+            bordercolor="#5dade2",
+            lightcolor="#5dade2",
+            darkcolor="#5dade2",
+            thickness=14,
+        )
 
         self.barra = ttk.Progressbar(
             self.root,
@@ -124,14 +174,54 @@ class VentanaProgreso:
             mode="determinate",
             maximum=self.total,
         )
-        self.barra.pack(pady=4)
+        self.barra.pack(pady=(2, 2))
+
+        self.label_pct = tk.Label(self.root, text="0%", font=("Segoe UI", 8))
+        self.label_pct.pack(pady=(0, 8))
+
+        # Barra secundaria (celeste), para el llenado fila a fila de cada
+        # hoja del Excel. Se muestra/oculta con mostrar_barra_hoja() /
+        # ocultar_barra_hoja() -- solo esta visible mientras se estan
+        # escribiendo filas al archivo.
+        self.frame_hoja = tk.Frame(self.root)
+        self.label_hoja = tk.Label(self.frame_hoja, text="", font=("Segoe UI", 8))
+        self.label_hoja.pack()
+        self.barra_hoja = ttk.Progressbar(
+            self.frame_hoja,
+            style="Celeste.Horizontal.TProgressbar",
+            orient="horizontal",
+            length=400,
+            mode="determinate",
+            maximum=100,
+        )
+        self.barra_hoja.pack(pady=(4, 4))
+        # frame_hoja no se empaqueta todavia -> arranca oculta
 
         self._refrescar()
 
-    def actualizar(self, valor: int, mensaje: str = ""):
-        self.barra["value"] = min(valor, self.total)
+    def actualizar(self, valor: float, mensaje: str = ""):
+        valor = min(valor, self.total)
+        self.barra["value"] = valor
+        pct = int(round((valor / self.total) * 100))
+        self.label_pct.config(text=f"{pct}%")
         if mensaje:
             self.label_estado.config(text=mensaje)
+        self._refrescar()
+
+    def mostrar_barra_hoja(self):
+        self.frame_hoja.pack(pady=(0, 4))
+        self._refrescar()
+
+    def ocultar_barra_hoja(self):
+        self.frame_hoja.pack_forget()
+        self._refrescar()
+
+    def actualizar_hoja(self, fila_actual: int, total_filas: int):
+        pct = int(round((fila_actual / total_filas) * 100)) if total_filas else 0
+        self.barra_hoja["value"] = pct
+        self.label_hoja.config(
+            text=f"Guardando Filas {fila_actual:,}/{total_filas:,} ({pct}%)"
+        )
         self._refrescar()
 
     def _refrescar(self):
@@ -283,7 +373,7 @@ def main():
         if not salida:
             print("No se guardó ningún archivo.")
             os._exit(0)
-        progreso = VentanaProgreso(1)
+        progreso = VentanaProgreso(total_pasos)
 
     progreso.actualizar(total_pasos - 1, "Guardando archivo combinado...")
 
