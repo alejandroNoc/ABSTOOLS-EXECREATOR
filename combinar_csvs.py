@@ -122,7 +122,7 @@ def main():
         msg = f"La carpeta no existe o no fue especificada: {carpeta!r}"
         print(msg)
         mostrar_error(msg, carpeta, modo_silencioso)
-        sys.exit(1)
+        os._exit(1)
 
     # Excluye el propio archivo de salida por si ya existe de una corrida anterior
     archivos_csv = sorted(
@@ -133,7 +133,7 @@ def main():
         msg = "No se encontraron archivos .csv en esa carpeta."
         print(msg)
         mostrar_error(msg, carpeta, modo_silencioso)
-        sys.exit(1)
+        os._exit(1)
 
     print(f"Encontrados {len(archivos_csv)} archivos CSV:")
     for f in archivos_csv:
@@ -152,7 +152,7 @@ def main():
         msg = "No se encontraron datos válidos (Timestamp/Valor/Tag) en los CSV."
         print(msg)
         mostrar_error(msg, carpeta, modo_silencioso)
-        sys.exit(1)
+        os._exit(1)
 
     resultado = todos_los_dfs[0]
     for d in todos_los_dfs[1:]:
@@ -191,6 +191,18 @@ def main():
         messagebox.showinfo("Listo", f"Archivo combinado guardado en:\n{salida}")
         root.destroy()
 
+    # Cierre forzado del proceso.
+    # Motivo: pandas/numpy (via las librerias de calculo que usan internamente,
+    # p.ej. OpenBLAS) a veces dejan hilos secundarios vivos que no terminan
+    # solos dentro de un .exe empaquetado con PyInstaller. Eso hace que el
+    # proceso quede "colgado" en el Administrador de Tareas aunque ya termino
+    # su trabajo (el archivo ya se genero y se abrio). os._exit() termina el
+    # proceso de inmediato sin esperar a esos hilos ni correr el cleanup
+    # normal del interprete -- es seguro aca porque ya no queda nada
+    # pendiente por guardar.
+    sys.stdout.flush() if sys.stdout else None
+    os._exit(0)
+
 
 if __name__ == "__main__":
     try:
@@ -200,4 +212,4 @@ if __name__ == "__main__":
         print(error_completo)
         carpeta_fallback = sys.argv[1] if len(sys.argv) > 1 else os.getcwd()
         mostrar_error(error_completo, carpeta_fallback, modo_silencioso=len(sys.argv) > 1)
-        sys.exit(1)
+        os._exit(1)
