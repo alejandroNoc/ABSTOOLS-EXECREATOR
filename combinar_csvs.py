@@ -52,9 +52,15 @@ from openpyxl import Workbook
 
 AUTOR = "PIEXTRACT BY: ALEJANDRO BURELO SANCHEZ"
 
-# Excel (.xlsx) soporta como maximo 1,048,576 filas por hoja (incluyendo el
-# encabezado). Dejamos un margen para el encabezado de cada hoja.
-FILAS_MAX_POR_HOJA = 1_048_575
+# Excel (.xlsx) soporta teoricamente como maximo 1,048,576 filas por hoja
+# (incluyendo el encabezado). En la practica, Excel a veces avisa "conjunto
+# de datos demasiado grande" incluso justo en ese limite exacto (parece
+# contar distinto al importar/abrir un CSV que al leer un .xlsx nativo).
+# Por eso dejamos un margen de seguridad del 15% por debajo del limite
+# teorico, tanto para el particionado de CSV como para las hojas de Excel.
+EXCEL_MAX_FILAS_TEORICO = 1_048_576
+MARGEN_SEGURIDAD = 0.85  # usar solo el 85% del limite teorico
+FILAS_MAX_POR_HOJA = int(EXCEL_MAX_FILAS_TEORICO * MARGEN_SEGURIDAD)  # ~891,289
 
 # Cada cuanto tiempo (segundos) se refresca la ventana mientras se escriben
 # filas. No es un porcentaje fijo: el avance se ve libre/continuo, y esto
