@@ -189,6 +189,91 @@ def guardar_excel_pyexcelerate(df: pd.DataFrame, salida: str, progreso=None, pas
     return n_hojas
 
 
+def _escribir_csv_con_progreso(
+    df: pd.DataFrame,
+    ruta: str,
+    progreso=None,
+    paso_base: float = 0,
+    total_filas_todas: int = 1,
+    filas_previas: int = 0,
+    idx_parte: int = 1,
+    n_partes: int = 1,
+) -> None:
+    """
+    Escribe un DataFrame a CSV en sub-bloques (no fila por fila) para
+    mantener la velocidad vectorizada de pandas, pero igual reportar
+    progreso mientras escribe (a diferencia de un unico to_csv() de un
+    golpe, que no da ninguna senal de avance).
+    """
+    total_filas = len(df)
+    if total_filas == 0:
+        # Igual hay que crear el archivo (con encabezado) aunque no haya filas
+        df.to_csv(ruta, index=False)
+        return
+
+    # ~100 sub-bloques (o menos si el archivo es chico) para el refresco visual
+    n_subbloques = min(100, max(1, total_filas // 5000))
+    tam_subbloque = -(-total_filas // n_subbloques)  # ceil
+
+    primero = True
+    filas_escritas_parte = 0
+    ultimo_refresco = 0.0
+
+    with open(ruta, "w", newline="", encoding="utf-8") as f:
+        for ini in range(0, total_filas, tam_subbloque):
+            sub = df.iloc[ini:ini + tam_subbloque]
+            sub.to_csv(f, index=False, header=primero, lineterminator="\n")
+            primero = False
+            filas_escritas_parte += len(sub)
+
+            if progreso:
+                ahora = time.perf_counter()
+                if ahora - ultimo_refresco >= INTERVALO_REFRESCO_SEGUNDOS or filas_escritas_parte == total_filas:
+                    ultimo_refresco = ahora
+                    valor_barra = paso_base + (
+                        (filas_previas + filas_escritas_parte) / total_filas_todas
+                    )
+                    progreso.actualizar(valor_barra)
+                    progreso.actualizar_hoja(filas_escritas_parte, total_filas)
+
+
+def guardar_csv_particionado(
+    df: pd.DataFrame, rutas_finales: list[str], progreso=None, paso_base: float = 0
+) -> None:
+    """
+    Guarda el DataFrame en uno o varios archivos CSV segun 'rutas_finales'
+    (ver calcular_rutas_csv_particionado): si es una sola ruta, escribe
+    todo ahi; si son varias, reparte las filas en bloques consecutivos,
+    uno por archivo, respetando el orden (ya viene ordenado por Timestamp).
+    """
+    total_filas_todas = len(df)
+    n_partes = len(rutas_finales)
+
+    if progreso:
+        progreso.mostrar_barra_hoja()
+
+    filas_previas = 0
+    for idx, ruta in enumerate(rutas_finales, start=1):
+        if n_partes == 1:
+            trozo = df
+        else:
+            ini = (idx - 1) * FILAS_MAX_POR_HOJA
+            fin = ini + FILAS_MAX_POR_HOJA
+            trozo = df.iloc[ini:fin]
+
+        if progreso:
+            valor_barra = paso_base + (filas_previas / total_filas_todas)
+            progreso.actualizar(valor_barra, f"Guardando archivo {idx}/{n_partes} (CSV)...")
+
+        _escribir_csv_con_progreso(
+            trozo, ruta, progreso, paso_base, total_filas_todas, filas_previas, idx, n_partes
+        )
+        filas_previas += len(trozo)
+
+    if progreso:
+        progreso.ocultar_barra_hoja()
+
+
 class VentanaProgreso:
     """Ventana simple con barra de progreso verde y el credito del autor
     arriba. Se actualiza llamando a .actualizar(valor, mensaje) y se cierra
@@ -310,22 +395,18 @@ class VentanaProgreso:
             pass
 
 
-def obtener_ruta_salida_disponible(carpeta: str, extension: str = ".csv") -> str:
+def _ruta_disponible(ruta_deseada: str) -> str:
     """
-    Devuelve una ruta de salida lista para escribir dentro de 'carpeta'.
-    Empieza probando "COMBINADO<extension>"; si ese archivo existe y esta
-    BLOQUEADO (por ejemplo porque alguien lo tiene abierto en Excel),
-    prueba "COMBINADO2<extension>", "COMBINADO3<extension>", etc. hasta
-    encontrar uno que se pueda escribir. Si el archivo existe pero NO esta
-    bloqueado, lo reusa igual (se sobrescribe, comportamiento de siempre).
-
-    Default: .csv -- es ~5x mas rapido de escribir que .xlsx y no tiene
-    limite de filas por hoja, asi que es el formato de salida por defecto.
+    Si 'ruta_deseada' no existe, la devuelve tal cual. Si existe pero NO
+    esta bloqueada (nadie la tiene abierta), la reusa igual (se
+    sobrescribe, comportamiento de siempre). Si existe y esta BLOQUEADA
+    (por ejemplo abierta en Excel), agrega un sufijo _2, _3, etc. antes
+    de la extension hasta encontrar una libre.
     """
+    base, ext = os.path.splitext(ruta_deseada)
     intento = 0
     while True:
-        nombre = f"COMBINADO{extension}" if intento == 0 else f"COMBINADO{intento + 1}{extension}"
-        candidato = os.path.join(carpeta, nombre)
+        candidato = ruta_deseada if intento == 0 else f"{base}_{intento + 1}{ext}"
 
         if not os.path.exists(candidato):
             return candidato
@@ -340,7 +421,39 @@ def obtener_ruta_salida_disponible(carpeta: str, extension: str = ".csv") -> str
             intento += 1
             if intento > 50:
                 # Ultimo recurso para no quedar en loop infinito
-                return os.path.join(carpeta, f"COMBINADO_{int(time.time())}{extension}")
+                return f"{base}_{int(time.time())}{ext}"
+
+
+def obtener_ruta_salida_disponible(carpeta: str, extension: str = ".csv") -> str:
+    """
+    Devuelve una ruta de salida lista para escribir dentro de 'carpeta',
+    probando "COMBINADO<extension>" y agregando un sufijo si esta
+    bloqueado (ver _ruta_disponible). Default: .csv -- es ~5x mas rapido
+    de escribir que .xlsx y no tiene limite de filas por archivo, asi que
+    es el formato de salida por defecto.
+    """
+    return _ruta_disponible(os.path.join(carpeta, f"COMBINADO{extension}"))
+
+
+def calcular_rutas_csv_particionado(carpeta: str, total_filas: int) -> list[str]:
+    """
+    Calcula las rutas finales para guardar 'total_filas' de datos como
+    CSV. El archivo CSV en si NO tiene limite de filas, pero Excel SI
+    tiene un limite de filas en su grilla (1,048,576) que aplica sin
+    importar el formato del archivo -- si se abre un CSV con mas filas
+    que eso, Excel avisa "conjunto de datos demasiado grande" y trunca
+    los datos si se guarda desde ahi. Por eso, si el total supera ese
+    limite, se reparte en varios archivos ("COMBINADO_parte1.csv",
+    "COMBINADO_parte2.csv", ...) para que cada uno abra completo en Excel.
+    Cada ruta ya viene verificada como disponible/no bloqueada.
+    """
+    if total_filas <= FILAS_MAX_POR_HOJA:
+        nombres = ["COMBINADO.csv"]
+    else:
+        n_partes = -(-total_filas // FILAS_MAX_POR_HOJA)  # ceil
+        nombres = [f"COMBINADO_parte{i + 1}.csv" for i in range(n_partes)]
+
+    return [_ruta_disponible(os.path.join(carpeta, nombre)) for nombre in nombres]
 
 
 def elegir_carpeta() -> str:
@@ -613,74 +726,94 @@ def main():
 
     if modo_silencioso:
         extension_salida = ".csv" if motor == "csv" else ".xlsx"
-        salida = obtener_ruta_salida_disponible(carpeta, extension=extension_salida)
+        if extension_salida == ".csv":
+            rutas_finales = calcular_rutas_csv_particionado(carpeta, len(resultado))
+            salida = rutas_finales[0]
+        else:
+            salida = obtener_ruta_salida_disponible(carpeta, extension=extension_salida)
+            rutas_finales = [salida]
         nombre_default = f"COMBINADO{extension_salida}"
         if os.path.basename(salida) != nombre_default:
-            print(f"{nombre_default} estaba bloqueado/abierto, se usa: {os.path.basename(salida)}")
+            print(f"{nombre_default} estaba bloqueado/abierto o se repartio en varios archivos, primero: {os.path.basename(salida)}")
     else:
         progreso.cerrar()
         salida = elegir_archivo_salida(carpeta)
         if not salida:
             print("No se guardó ningún archivo.")
             os._exit(0)
+        rutas_finales = [salida]
         progreso = VentanaProgreso(total_pasos)
 
     progreso.actualizar(total_pasos - 1, "Guardando archivo combinado...")
 
-    # Escribimos primero a un archivo temporal en el disco local (la carpeta
-    # temporal de Windows, %TEMP%), NO en la carpeta final del usuario.
-    # Motivo: si la carpeta final esta sincronizada con OneDrive (muy comun
-    # que "Escritorio" este redirigido ahi sin que el usuario lo note),
-    # cada escritura incremental dispara al cliente de sincronizacion y eso
-    # frena mucho el proceso (se ve como que la barra "se traba" a mitad de
-    # camino). Escribiendo local y moviendo el archivo ya terminado de un
-    # solo golpe al final evitamos ese frenado.
-    extension = ".xlsx" if salida.lower().endswith(".xlsx") else ".csv"
-    fd_temp, ruta_temporal = tempfile.mkstemp(suffix=extension, prefix="piextract_")
-    os.close(fd_temp)
+    # Escribimos primero en una carpeta temporal en el disco local (%TEMP%
+    # de Windows), NO en la carpeta final del usuario. Motivo: si la
+    # carpeta final esta sincronizada con OneDrive (muy comun que
+    # "Escritorio" este redirigido ahi sin que el usuario lo note), cada
+    # escritura incremental dispara al cliente de sincronizacion y eso
+    # frena mucho el proceso (se ve como que la barra "se traba" a mitad
+    # de camino). Escribiendo local y moviendo los archivos ya terminados
+    # de un solo golpe al final evitamos ese frenado.
+    carpeta_temp = tempfile.mkdtemp(prefix="piextract_")
 
     try:
         if salida.lower().endswith(".xlsx"):
+            ruta_temp_xlsx = os.path.join(carpeta_temp, os.path.basename(salida))
             usar_pyexcelerate = motor == "xlsx"  # "xlsx_openpyxl" fuerza openpyxl
             n_hojas = None
             if usar_pyexcelerate:
                 try:
                     n_hojas = guardar_excel_pyexcelerate(
-                        resultado, ruta_temporal, progreso=progreso, paso_base=total_pasos - 1
+                        resultado, ruta_temp_xlsx, progreso=progreso, paso_base=total_pasos - 1
                     )
                 except ImportError:
                     print("pyexcelerate no esta instalado, se usa openpyxl como respaldo.")
                     usar_pyexcelerate = False
             if not usar_pyexcelerate:
                 n_hojas = guardar_excel_multi_hoja(
-                    resultado, ruta_temporal, progreso=progreso, paso_base=total_pasos - 1
+                    resultado, ruta_temp_xlsx, progreso=progreso, paso_base=total_pasos - 1
                 )
             if n_hojas and n_hojas > 1:
                 print(
                     f"Datos repartidos en {n_hojas} hojas "
                     f"(limite de Excel: {FILAS_MAX_POR_HOJA} filas por hoja)."
                 )
-        else:
-            resultado.to_csv(ruta_temporal, index=False)
 
-        progreso.actualizar(total_pasos - 0.02, "Moviendo archivo a la carpeta final...")
-        shutil.move(ruta_temporal, salida)
+            progreso.actualizar(total_pasos - 0.02, "Moviendo archivo a la carpeta final...")
+            shutil.move(ruta_temp_xlsx, salida)
+        else:
+            if len(rutas_finales) > 1:
+                print(
+                    f"El dataset tiene {len(resultado):,} filas: se reparte en "
+                    f"{len(rutas_finales)} archivos CSV (limite de la grilla de "
+                    f"Excel: {FILAS_MAX_POR_HOJA} filas por archivo)."
+                )
+            rutas_temp = [
+                os.path.join(carpeta_temp, os.path.basename(r)) for r in rutas_finales
+            ]
+            guardar_csv_particionado(
+                resultado, rutas_temp, progreso=progreso, paso_base=total_pasos - 1
+            )
+
+            progreso.actualizar(total_pasos - 0.02, "Moviendo archivo(s) a la carpeta final...")
+            for ruta_temp, ruta_final in zip(rutas_temp, rutas_finales):
+                shutil.move(ruta_temp, ruta_final)
     finally:
-        # Por si algo fallo despues de crear el temporal pero antes del move
-        if os.path.exists(ruta_temporal):
-            try:
-                os.remove(ruta_temporal)
-            except Exception:
-                pass
+        shutil.rmtree(carpeta_temp, ignore_errors=True)
 
     progreso.actualizar(total_pasos, "Listo.")
-    print(f"Archivo combinado guardado en: {salida}")
+    if len(rutas_finales) > 1:
+        print(f"Archivos generados ({len(rutas_finales)}):")
+        for r in rutas_finales:
+            print(f"  - {r}")
+    else:
+        print(f"Archivo combinado guardado en: {rutas_finales[0]}")
 
     progreso.cerrar()
 
-    # Abrir el archivo final automáticamente (Windows)
+    # Abrir el primer archivo (o el unico) automaticamente
     try:
-        os.startfile(salida)  # type: ignore[attr-defined]
+        os.startfile(rutas_finales[0])  # type: ignore[attr-defined]
     except Exception:
         pass  # si no es Windows o falla, simplemente no lo abre
 
