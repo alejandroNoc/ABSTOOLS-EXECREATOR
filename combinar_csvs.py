@@ -5,18 +5,22 @@ alineados por Timestamp, rellenando los huecos con forward-fill y luego backward
 PIEXTRACT - by Alejandro Burelo Sanchez
 
 Requisitos:
-    pip install pandas openpyxl
+    pip install pandas openpyxl pyexcelerate
 
 Dos modos de uso:
 
   1) MODO INTERACTIVO (doble clic o "python combinar_csvs.py" sin argumentos):
-     se abren diálogos para elegir la carpeta y dónde guardar el resultado.
+     se abren diálogos para elegir la carpeta y dónde guardar el resultado
+     (el diálogo deja elegir CSV o Excel).
 
   2) MODO SILENCIOSO / DESATENDIDO (para llamarlo desde VBA, un .exe, etc.):
-         python combinar_csvs.py "C:\\ruta\\a\\la\\carpeta\\con\\csv"
+         python combinar_csvs.py "C:\\ruta\\a\\la\\carpeta\\con\\csv" [motor]
      - No pregunta carpeta ni nombre de salida.
-     - Genera "COMBINADO.xlsx" dentro de esa misma carpeta (sobrescribiendo
-       si ya existe).
+     - "motor" (opcional, default "csv"):
+         "csv"           -> COMBINADO.csv (el mas rapido, sin limite de filas)
+         "xlsx"          -> COMBINADO.xlsx usando pyexcelerate (mas rapido que
+                             openpyxl; si no esta instalado, cae a openpyxl)
+         "xlsx_openpyxl" -> COMBINADO.xlsx forzando openpyxl
      - Al terminar abre el archivo automáticamente (os.startfile, Windows).
      - Si algo falla, el error queda registrado en "COMBINADO_error.log"
        dentro de la misma carpeta.
@@ -35,7 +39,9 @@ Soporta dos formatos de CSV:
 import glob
 import os
 import re
+import shutil
 import sys
+import tempfile
 import time
 import traceback
 import tkinter as tk
@@ -113,6 +119,71 @@ def guardar_excel_multi_hoja(df: pd.DataFrame, salida: str, progreso=None, paso_
 
     if progreso:
         progreso.ocultar_barra_hoja()
+
+    wb.save(salida)
+    return n_hojas
+
+
+def guardar_excel_pyexcelerate(df: pd.DataFrame, salida: str, progreso=None, paso_base: float = 0) -> int:
+    """
+    Guarda el DataFrame en un .xlsx usando la libreria pyexcelerate en vez
+    de openpyxl. Es ~30-40% mas rapido que openpyxl para escribir, porque
+    arma cada hoja de un solo golpe (bulk) en vez de fila por fila.
+    Contrapartida: como escribe en bloque, el progreso dentro de cada hoja
+    NO es granular fila-a-fila como con openpyxl -- se reporta por hoja
+    completa (no hay barra celeste "Guardando Filas N/Total" para este
+    motor). Igual que guardar_excel_multi_hoja, reparte en varias hojas
+    ("Datos1", "Datos2", ...) si se pasa del limite de filas de Excel.
+    """
+    from pyexcelerate import Workbook as PyExcelerateWorkbook
+    from pyexcelerate import Style, Format
+
+    total_filas_todas = len(df)
+
+    if total_filas_todas <= FILAS_MAX_POR_HOJA:
+        chunks = [df]
+    else:
+        n_hojas_calc = -(-total_filas_todas // FILAS_MAX_POR_HOJA)  # ceil
+        chunks = [
+            df.iloc[i * FILAS_MAX_POR_HOJA:(i + 1) * FILAS_MAX_POR_HOJA]
+            for i in range(n_hojas_calc)
+        ]
+
+    n_hojas = len(chunks)
+    wb = PyExcelerateWorkbook()
+    filas_escritas_total = 0
+
+    for idx, chunk in enumerate(chunks, start=1):
+        nombre_hoja = "Datos" if n_hojas == 1 else f"Datos{idx}"
+
+        if progreso:
+            valor_barra = paso_base + (filas_escritas_total / total_filas_todas)
+            progreso.actualizar(
+                valor_barra, f"Preparando datos para hoja {idx}/{n_hojas} (pyexcelerate)..."
+            )
+
+        # NaN/NaT no son validos -> los pasamos a None (celda vacia)
+        chunk_seguro = chunk.astype(object).where(pd.notnull(chunk), None)
+        datos = [list(chunk_seguro.columns)] + chunk_seguro.values.tolist()
+
+        if progreso:
+            valor_barra = paso_base + (filas_escritas_total / total_filas_todas)
+            progreso.actualizar(
+                valor_barra, f"Escribiendo hoja {idx}/{n_hojas} ({len(chunk_seguro):,} filas)..."
+            )
+
+        ws = wb.new_sheet(nombre_hoja, data=datos)
+        # Columna 1 (Timestamp) con formato de fecha -- si no, Excel la
+        # muestra como numero serial en vez de fecha legible.
+        ws.set_col_style(1, Style(size=-1, format=Format("yyyy-mm-dd hh:mm:ss")))
+
+        filas_escritas_total += len(chunk_seguro)
+        if progreso:
+            valor_barra = paso_base + (filas_escritas_total / total_filas_todas)
+            progreso.actualizar(valor_barra, f"Hoja {idx}/{n_hojas} lista.")
+
+    if progreso:
+        progreso.actualizar(paso_base + 0.9, "Guardando archivo (pyexcelerate)...")
 
     wb.save(salida)
     return n_hojas
@@ -239,18 +310,21 @@ class VentanaProgreso:
             pass
 
 
-def obtener_ruta_salida_disponible(carpeta: str) -> str:
+def obtener_ruta_salida_disponible(carpeta: str, extension: str = ".csv") -> str:
     """
     Devuelve una ruta de salida lista para escribir dentro de 'carpeta'.
-    Empieza probando "COMBINADO.xlsx"; si ese archivo existe y esta
+    Empieza probando "COMBINADO<extension>"; si ese archivo existe y esta
     BLOQUEADO (por ejemplo porque alguien lo tiene abierto en Excel),
-    prueba "COMBINADO2.xlsx", "COMBINADO3.xlsx", etc. hasta encontrar uno
-    que se pueda escribir. Si el archivo existe pero NO esta bloqueado,
-    lo reusa igual (se sobrescribe, comportamiento de siempre).
+    prueba "COMBINADO2<extension>", "COMBINADO3<extension>", etc. hasta
+    encontrar uno que se pueda escribir. Si el archivo existe pero NO esta
+    bloqueado, lo reusa igual (se sobrescribe, comportamiento de siempre).
+
+    Default: .csv -- es ~5x mas rapido de escribir que .xlsx y no tiene
+    limite de filas por hoja, asi que es el formato de salida por defecto.
     """
     intento = 0
     while True:
-        nombre = "COMBINADO.xlsx" if intento == 0 else f"COMBINADO{intento + 1}.xlsx"
+        nombre = f"COMBINADO{extension}" if intento == 0 else f"COMBINADO{intento + 1}{extension}"
         candidato = os.path.join(carpeta, nombre)
 
         if not os.path.exists(candidato):
@@ -266,7 +340,7 @@ def obtener_ruta_salida_disponible(carpeta: str) -> str:
             intento += 1
             if intento > 50:
                 # Ultimo recurso para no quedar en loop infinito
-                return os.path.join(carpeta, f"COMBINADO_{int(time.time())}.xlsx")
+                return os.path.join(carpeta, f"COMBINADO_{int(time.time())}{extension}")
 
 
 def elegir_carpeta() -> str:
@@ -285,9 +359,9 @@ def elegir_archivo_salida(carpeta_inicial: str) -> str:
     salida = filedialog.asksaveasfilename(
         title="Guardar archivo combinado como...",
         initialdir=carpeta_inicial,
-        initialfile="COMBINADO.xlsx",
-        defaultextension=".xlsx",
-        filetypes=[("Excel", "*.xlsx"), ("CSV", "*.csv")],
+        initialfile="COMBINADO.csv",
+        defaultextension=".csv",
+        filetypes=[("CSV (recomendado, mas rapido)", "*.csv"), ("Excel", "*.xlsx")],
     )
     root.destroy()
     return salida
@@ -338,18 +412,20 @@ _MESES_A_NUMERO = {
     "nov": "11",
     "dic": "12", "dec": "12",
 }
-_PATRON_MES = re.compile(
-    r"(?i)\b(" + "|".join(sorted(_MESES_A_NUMERO.keys(), key=len, reverse=True)) + r")\.?\b"
-)
 
+# El VBA (LanzarCombinadorEXE / SoloExtraer) ahora escribe el Timestamp
+# directamente en ISO 8601, que es lo primero que probamos: pandas tiene
+# un parser en C especifico para ISO, ~10-20x mas rapido que cualquier
+# formato con nombre de mes en texto. El resto queda como respaldo por si
+# se procesan CSVs viejos generados antes de este cambio.
 _FORMATOS_FECHA_CANDIDATOS = [
+    "%Y-%m-%d %H:%M:%S",
     "%d-%m-%y %H:%M:%S",
     "%d-%m-%Y %H:%M:%S",
     "%d/%m/%Y %H:%M:%S",
     "%d/%m/%y %H:%M:%S",
     "%m/%d/%Y %I:%M:%S %p",
     "%m/%d/%y %I:%M:%S %p",
-    "%Y-%m-%d %H:%M:%S",
 ]
 
 # Cache global: una vez detectado el formato para esta corrida, se reusa
@@ -358,10 +434,39 @@ _FORMATOS_FECHA_CANDIDATOS = [
 _formato_fecha_cache: str | None = None
 
 
-def _normalizar_nombres_de_mes(serie_texto: pd.Series) -> pd.Series:
-    def _reemplazar(m: "re.Match[str]") -> str:
-        return _MESES_A_NUMERO[m.group(1).lower()]
-    return serie_texto.astype(str).str.replace(_PATRON_MES, _reemplazar, regex=True)
+def _contiene_letras(valor: str) -> bool:
+    return bool(re.search(r"[A-Za-z]", valor))
+
+
+def _normalizar_nombres_de_mes_rapido(serie_texto: pd.Series) -> pd.Series:
+    """
+    Reemplaza el nombre del mes (ingles o espanol, con o sin punto) por su
+    numero de 2 digitos. Usa slicing vectorizado + mapeo por diccionario
+    (mucho mas rapido que una regex de alternancia sobre toda la columna).
+    Si el primer valor no tiene letras (ya es numerico, p.ej. ISO 8601),
+    no hace nada -- esto hace que los CSV nuevos (ISO) salten este paso
+    por completo.
+    """
+    muestra = serie_texto.dropna()
+    if len(muestra) == 0:
+        return serie_texto
+
+    primer_valor = str(muestra.iloc[0])
+    if not _contiene_letras(primer_valor):
+        return serie_texto  # ya es numerico/ISO, nada que normalizar
+
+    m = re.search(r"[A-Za-z]{3,4}\.?", primer_valor)
+    if not m:
+        return serie_texto
+    ini, fin = m.start(), m.end()
+
+    serie_str = serie_texto.astype(str)
+    prefijo = serie_str.str[:ini]
+    mes_texto = serie_str.str[ini:fin].str.rstrip(".").str.lower()
+    sufijo = serie_str.str[fin:]
+    mes_numero = mes_texto.map(_MESES_A_NUMERO)
+    mes_numero = mes_numero.fillna(mes_texto)  # si algo no matcheo, no romper
+    return prefijo + mes_numero + sufijo
 
 
 def _detectar_formato(muestra: pd.Series) -> str | None:
@@ -386,7 +491,7 @@ def parsear_timestamps_rapido(serie_original: pd.Series) -> pd.Series:
     aunque mas lento)."""
     global _formato_fecha_cache
 
-    normalizada = _normalizar_nombres_de_mes(serie_original)
+    normalizada = _normalizar_nombres_de_mes_rapido(serie_original)
 
     if _formato_fecha_cache:
         parsed = pd.to_datetime(normalizada, format=_formato_fecha_cache, errors="coerce")
@@ -410,7 +515,10 @@ def leer_csv_como_bloques(path: str) -> list[pd.DataFrame]:
     uno por cada tag encontrado, ya sea que el archivo tenga un solo tag
     o varios en bloques de 3 columnas.
     """
-    raw = pd.read_csv(path, header=None, low_memory=False)
+    # dtype=str: ~2x mas rapido que dejar que pandas infiera el tipo de
+    # cada columna. Como resultado "Valor" queda como texto y hay que
+    # convertirlo a numerico a mano mas abajo (pd.to_numeric).
+    raw = pd.read_csv(path, header=None, dtype=str)
 
     dfs = []
     col = 0
@@ -422,6 +530,8 @@ def leer_csv_como_bloques(path: str) -> list[pd.DataFrame]:
         if len(bloque) > 0 and bloque["Tag"].notna().any():
             tag_name = bloque["Tag"].dropna().iloc[0]
             bloque = bloque[["Timestamp", "Valor"]].dropna()
+            bloque["Valor"] = pd.to_numeric(bloque["Valor"], errors="coerce")
+            bloque = bloque.dropna(subset=["Valor"])
             bloque.columns = ["Timestamp", tag_name]
             bloque["Timestamp"] = parsear_timestamps_rapido(bloque["Timestamp"])
             bloque = bloque.dropna(subset=["Timestamp"]).drop_duplicates(subset=["Timestamp"])
@@ -437,6 +547,17 @@ def main():
     # --- Determinar modo: silencioso (con carpeta como argumento) o interactivo ---
     modo_silencioso = len(sys.argv) > 1
     carpeta = sys.argv[1] if modo_silencioso else elegir_carpeta()
+
+    # --- Motor de guardado (solo aplica en modo silencioso; en modo
+    # interactivo el usuario elige extension en el dialogo de guardar) ---
+    # "csv"          -> pandas.to_csv (el mas rapido, sin limite de filas)
+    # "xlsx"         -> pyexcelerate (si esta instalado) con fallback a
+    #                    openpyxl si no esta disponible
+    # "xlsx_openpyxl"-> fuerza openpyxl aunque pyexcelerate este instalado
+    motor = sys.argv[2].strip().lower() if len(sys.argv) > 2 else "csv"
+    if motor not in ("csv", "xlsx", "xlsx_openpyxl"):
+        print(f"Motor '{motor}' no reconocido, se usa 'csv' por defecto.")
+        motor = "csv"
 
     if not carpeta or not os.path.isdir(carpeta):
         msg = f"La carpeta no existe o no fue especificada: {carpeta!r}"
@@ -491,9 +612,11 @@ def main():
     resultado = resultado.ffill().bfill()
 
     if modo_silencioso:
-        salida = obtener_ruta_salida_disponible(carpeta)
-        if os.path.basename(salida) != "COMBINADO.xlsx":
-            print(f"COMBINADO.xlsx estaba bloqueado/abierto, se usa: {os.path.basename(salida)}")
+        extension_salida = ".csv" if motor == "csv" else ".xlsx"
+        salida = obtener_ruta_salida_disponible(carpeta, extension=extension_salida)
+        nombre_default = f"COMBINADO{extension_salida}"
+        if os.path.basename(salida) != nombre_default:
+            print(f"{nombre_default} estaba bloqueado/abierto, se usa: {os.path.basename(salida)}")
     else:
         progreso.cerrar()
         salida = elegir_archivo_salida(carpeta)
@@ -504,17 +627,51 @@ def main():
 
     progreso.actualizar(total_pasos - 1, "Guardando archivo combinado...")
 
-    if salida.lower().endswith(".xlsx"):
-        n_hojas = guardar_excel_multi_hoja(
-            resultado, salida, progreso=progreso, paso_base=total_pasos - 1
-        )
-        if n_hojas > 1:
-            print(
-                f"Datos repartidos en {n_hojas} hojas "
-                f"(limite de Excel: {FILAS_MAX_POR_HOJA} filas por hoja)."
-            )
-    else:
-        resultado.to_csv(salida, index=False)
+    # Escribimos primero a un archivo temporal en el disco local (la carpeta
+    # temporal de Windows, %TEMP%), NO en la carpeta final del usuario.
+    # Motivo: si la carpeta final esta sincronizada con OneDrive (muy comun
+    # que "Escritorio" este redirigido ahi sin que el usuario lo note),
+    # cada escritura incremental dispara al cliente de sincronizacion y eso
+    # frena mucho el proceso (se ve como que la barra "se traba" a mitad de
+    # camino). Escribiendo local y moviendo el archivo ya terminado de un
+    # solo golpe al final evitamos ese frenado.
+    extension = ".xlsx" if salida.lower().endswith(".xlsx") else ".csv"
+    fd_temp, ruta_temporal = tempfile.mkstemp(suffix=extension, prefix="piextract_")
+    os.close(fd_temp)
+
+    try:
+        if salida.lower().endswith(".xlsx"):
+            usar_pyexcelerate = motor == "xlsx"  # "xlsx_openpyxl" fuerza openpyxl
+            n_hojas = None
+            if usar_pyexcelerate:
+                try:
+                    n_hojas = guardar_excel_pyexcelerate(
+                        resultado, ruta_temporal, progreso=progreso, paso_base=total_pasos - 1
+                    )
+                except ImportError:
+                    print("pyexcelerate no esta instalado, se usa openpyxl como respaldo.")
+                    usar_pyexcelerate = False
+            if not usar_pyexcelerate:
+                n_hojas = guardar_excel_multi_hoja(
+                    resultado, ruta_temporal, progreso=progreso, paso_base=total_pasos - 1
+                )
+            if n_hojas and n_hojas > 1:
+                print(
+                    f"Datos repartidos en {n_hojas} hojas "
+                    f"(limite de Excel: {FILAS_MAX_POR_HOJA} filas por hoja)."
+                )
+        else:
+            resultado.to_csv(ruta_temporal, index=False)
+
+        progreso.actualizar(total_pasos - 0.02, "Moviendo archivo a la carpeta final...")
+        shutil.move(ruta_temporal, salida)
+    finally:
+        # Por si algo fallo despues de crear el temporal pero antes del move
+        if os.path.exists(ruta_temporal):
+            try:
+                os.remove(ruta_temporal)
+            except Exception:
+                pass
 
     progreso.actualizar(total_pasos, "Listo.")
     print(f"Archivo combinado guardado en: {salida}")
