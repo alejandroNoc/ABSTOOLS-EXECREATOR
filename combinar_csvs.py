@@ -36,6 +36,7 @@ Soporta dos formatos de CSV:
      del otro, separados por una columna vacía.
 """
 
+import ctypes
 import glob
 import os
 import re
@@ -662,6 +663,90 @@ def leer_csv_como_bloques(path: str) -> list[pd.DataFrame]:
     return dfs
 
 
+def _listar_ventanas_excel() -> set:
+    """Devuelve el conjunto de handles de todas las ventanas visibles de
+    Excel (clase de ventana "XLMAIN") actualmente abiertas."""
+    if not sys.platform.startswith("win"):
+        return set()
+
+    user32 = ctypes.windll.user32
+    handles = []
+
+    WNDENUMPROC = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
+
+    def _callback(hwnd, lparam):
+        buffer = ctypes.create_unicode_buffer(256)
+        user32.GetClassNameW(hwnd, buffer, 256)
+        if buffer.value == "XLMAIN" and user32.IsWindowVisible(hwnd):
+            handles.append(hwnd)
+        return True
+
+    user32.EnumWindows(WNDENUMPROC(_callback), 0)
+    return set(handles)
+
+
+def forzar_foco_ventana_excel(nombre_archivo: str, timeout: float = 25.0) -> None:
+    """
+    Windows bloquea, a proposito, que un proceso en segundo plano (como
+    este .exe, lanzado por VBA con waitOnReturn=False y sin foco) le robe
+    el foco a la ventana activa. Por eso Excel se abre pero se queda
+    atras en la barra de tareas en vez de saltar al frente.
+
+    Esto espera a que aparezca una ventana nueva de Excel (o una que
+    muestre el nombre de nuestro archivo en el titulo) y fuerza que pase
+    al frente, usando la tecnica estandar de Windows: adjuntar la cola de
+    entrada del proceso actual a la del proceso en primer plano
+    (AttachThreadInput), lo que habilita el permiso para llamar a
+    SetForegroundWindow sobre la ventana de Excel.
+
+    No hace nada (silenciosamente) si no es Windows, si no se encuentra
+    la ventana a tiempo, o si algo falla -- es una mejora de UX, nunca
+    debe interrumpir el resto del proceso.
+    """
+    if not sys.platform.startswith("win"):
+        return
+
+    try:
+        user32 = ctypes.windll.user32
+        kernel32 = ctypes.windll.kernel32
+
+        ventanas_antes = _listar_ventanas_excel()
+        nombre_sin_ext = os.path.splitext(os.path.basename(nombre_archivo))[0].lower()
+
+        hwnd_objetivo = None
+        t0 = time.perf_counter()
+        while time.perf_counter() - t0 < timeout:
+            ventanas_ahora = _listar_ventanas_excel()
+            nuevas = ventanas_ahora - ventanas_antes
+            candidatas = nuevas if nuevas else ventanas_ahora
+
+            for hwnd in candidatas:
+                titulo = ctypes.create_unicode_buffer(512)
+                user32.GetWindowTextW(hwnd, titulo, 512)
+                if nombre_sin_ext in titulo.value.lower():
+                    hwnd_objetivo = hwnd
+                    break
+
+            if hwnd_objetivo:
+                break
+            time.sleep(0.3)
+
+        if not hwnd_objetivo:
+            return  # no aparecio a tiempo -- no forzamos nada
+
+        hwnd_frente = user32.GetForegroundWindow()
+        id_hilo_actual = kernel32.GetCurrentThreadId()
+        id_hilo_frente = user32.GetWindowThreadProcessId(hwnd_frente, None)
+
+        user32.AttachThreadInput(id_hilo_actual, id_hilo_frente, True)
+        user32.ShowWindow(hwnd_objetivo, 9)  # SW_RESTORE, por si esta minimizada
+        user32.SetForegroundWindow(hwnd_objetivo)
+        user32.BringWindowToTop(hwnd_objetivo)
+        user32.AttachThreadInput(id_hilo_actual, id_hilo_frente, False)
+    except Exception:
+        pass  # mejora de UX -- nunca debe romper el resto del proceso
+
+
 def main():
     # --- Determinar modo: silencioso (con carpeta como argumento) o interactivo ---
     modo_silencioso = len(sys.argv) > 1
@@ -820,6 +905,7 @@ def main():
     # Abrir el primer archivo (o el unico) automaticamente
     try:
         os.startfile(rutas_finales[0])  # type: ignore[attr-defined]
+        forzar_foco_ventana_excel(rutas_finales[0])
     except Exception:
         pass  # si no es Windows o falla, simplemente no lo abre
 
