@@ -37,6 +37,7 @@ from datetime import datetime
 
 try:
     import win32com.client
+    import win32com.client.gencache
     import pythoncom
 except ImportError:
     win32com = None
@@ -49,6 +50,21 @@ except ImportError:
 
 import tkinter as tk
 from tkinter import messagebox
+
+
+def _preparar_cache_com():
+    """Cuando este script corre como .exe compilado (PyInstaller), la
+    cache de tipos que necesita gencache.EnsureDispatch puede intentar
+    escribirse dentro del paquete empaquetado (de solo lectura) y fallar
+    en silencio o de forma rara. Forzamos que use una carpeta temporal
+    del usuario, que siempre es escribible."""
+    if win32com is None:
+        return
+    if getattr(sys, "frozen", False):
+        import tempfile
+        cache_dir = os.path.join(tempfile.gettempdir(), "abspiexcelextract_gen_py")
+        os.makedirs(cache_dir, exist_ok=True)
+        win32com.__gen_path__ = cache_dir
 
 
 class VentanaProgreso:
@@ -137,8 +153,17 @@ def extraer_series(params, ui):
     ui.log(f"Tags a extraer: {len(tags)}")
     ui.estado("Conectando a PI...")
 
+    # IMPORTANTE: usamos gencache.EnsureDispatch (enlace temprano) en vez de
+    # win32com.client.Dispatch (enlace tardio/generico) para PISDK y PITime.
+    # Con Dispatch generico, pasar un objeto COM (como ts_start/ts_end) como
+    # ARGUMENTO de otro metodo COM (RecordedValues) a veces falla con
+    # "The Python instance can not be converted to a COM object", porque el
+    # wrapper generico no conoce la firma exacta del metodo. EnsureDispatch
+    # genera un wrapper con la definicion real del tipo (equivalente a usar
+    # "Dim x As PISDK.PISDK" en VBA en vez de "CreateObject"), lo que
+    # resuelve el problema de raiz.
     try:
-        pisdk = win32com.client.Dispatch("PISDK.PISDK")
+        pisdk = win32com.client.gencache.EnsureDispatch("PISDK.PISDK")
     except Exception as e:
         ui.log(f"ERROR: no se pudo crear el objeto PISDK.PISDK. "
                f"Verifica que PI-SDK este instalado en esta maquina.\n{e}")
@@ -150,8 +175,8 @@ def extraer_series(params, ui):
         ui.log(f"ERROR: no se pudo conectar al servidor '{servidor_nombre}'.\n{e}")
         return []
 
-    ts_start = win32com.client.Dispatch("PITimeServer.PITime")
-    ts_end = win32com.client.Dispatch("PITimeServer.PITime")
+    ts_start = win32com.client.gencache.EnsureDispatch("PITimeServer.PITime")
+    ts_end = win32com.client.gencache.EnsureDispatch("PITimeServer.PITime")
     ts_start.UTCSeconds = utc_start
     ts_end.UTCSeconds = utc_end
 
@@ -282,6 +307,8 @@ def trabajo_principal(ui, ruta_json, carpeta_salida):
 
 
 def main():
+    _preparar_cache_com()
+
     if len(sys.argv) < 2:
         root = tk.Tk()
         root.withdraw()
