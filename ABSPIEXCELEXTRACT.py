@@ -37,8 +37,10 @@ from datetime import datetime
 
 try:
     import win32com.client
+    import pythoncom
 except ImportError:
     win32com = None
+    pythoncom = None
 
 try:
     import pandas as pd
@@ -228,7 +230,14 @@ def combinar_series(series, ui):
 
 
 def trabajo_principal(ui, ruta_json, carpeta_salida):
-    """Corre en un hilo aparte para no congelar la ventana."""
+    """Corre en un hilo aparte para no congelar la ventana.
+    IMPORTANTE: los objetos COM (PISDK, PITimeServer) requieren que
+    el hilo donde se usan tenga COM inicializado -- por default solo
+    el hilo principal lo tiene. Como esta funcion corre en un
+    threading.Thread aparte, hay que inicializar COM aqui mismo con
+    pythoncom.CoInitialize() antes de crear cualquier objeto COM, y
+    liberarlo con CoUninitialize() al terminar."""
+    com_inicializado = False
     try:
         if win32com is None:
             ui.log("ERROR: falta pywin32 en este build.")
@@ -238,6 +247,9 @@ def trabajo_principal(ui, ruta_json, carpeta_salida):
             ui.log("ERROR: falta pandas en este build.")
             ui.terminar(exito=False)
             return
+
+        pythoncom.CoInitialize()
+        com_inicializado = True
 
         params = cargar_parametros(ruta_json)
         series = extraer_series(params, ui)
@@ -264,6 +276,9 @@ def trabajo_principal(ui, ruta_json, carpeta_salida):
     except Exception as e:
         ui.log(f"\nERROR INESPERADO: {e}")
         ui.terminar(exito=False)
+    finally:
+        if com_inicializado:
+            pythoncom.CoUninitialize()
 
 
 def main():
