@@ -10,15 +10,18 @@ A partir de un archivo de parametros JSON generado por la macro VBA
      de Excel/Python (pivot por Tag, sin inventar fechas).
   3. Escribe un unico CSV combinado, listo para usar.
 
+Muestra una ventanita de progreso (Tkinter) con el avance en vivo,
+para poder compilarse con --noconsole y aun asi ver que esta pasando.
+
 Pensado para compilarse como ABSPIEXCELEXTRACT.exe con PyInstaller,
 de forma que el usuario final solo reciba el ejecutable y el JSON
 de parametros, sin ver ni poder modificar la logica interna.
 
 Requisitos para COMPILAR (no para el usuario final):
     pip install pywin32 pandas pyinstaller
-    pyinstaller --onefile --name ABSPIEXCELEXTRACT ABSPIEXCELEXTRACT.py
+    pyinstaller --onefile --noconsole --name ABSPIEXCELEXTRACT ABSPIEXCELEXTRACT.py
 
-Este .exe debe quedar instalado en: C:\ABSTOOLS\ABSPIEXCELEXTRACT.exe
+Este .exe debe quedar instalado en: C:\\ABSTOOLS\\ABSPIEXCELEXTRACT.exe
 (esa es la ruta que espera el modulo VBA "GenerarParametrosExtraccion"
 si el usuario elige lanzarlo automaticamente desde ProcessBook).
 
@@ -29,19 +32,83 @@ import sys
 import os
 import json
 import csv
+import threading
 from datetime import datetime
 
 try:
     import win32com.client
 except ImportError:
-    print("ERROR: falta pywin32. Instalalo con: pip install pywin32")
-    sys.exit(1)
+    win32com = None
 
 try:
     import pandas as pd
 except ImportError:
-    print("ERROR: falta pandas. Instalalo con: pip install pandas")
-    sys.exit(1)
+    pd = None
+
+import tkinter as tk
+from tkinter import messagebox
+
+
+class VentanaProgreso:
+    """Ventanita de progreso simple: un titulo, una barra de estado
+    y una caja de texto tipo log. No usa mainloop() de forma
+    bloqueante -- se actualiza manualmente con update() desde el
+    hilo de trabajo, igual que en el combinador original."""
+
+    def __init__(self):
+        self.root = tk.Tk()
+        self.root.title("ABSPIEXCELEXTRACT")
+        self.root.geometry("640x420")
+        self.root.resizable(True, True)
+
+        titulo = tk.Label(self.root, text="ABSPIEXCELEXTRACT",
+                           font=("Segoe UI", 14, "bold"))
+        titulo.pack(pady=(12, 0))
+
+        self.estado_var = tk.StringVar(value="Iniciando...")
+        estado_lbl = tk.Label(self.root, textvariable=self.estado_var,
+                               font=("Segoe UI", 10))
+        estado_lbl.pack(pady=(4, 8))
+
+        frame_log = tk.Frame(self.root)
+        frame_log.pack(fill="both", expand=True, padx=12, pady=(0, 12))
+
+        scrollbar = tk.Scrollbar(frame_log)
+        scrollbar.pack(side="right", fill="y")
+
+        self.texto = tk.Text(frame_log, wrap="word", font=("Consolas", 9),
+                              yscrollcommand=scrollbar.set)
+        self.texto.pack(side="left", fill="both", expand=True)
+        scrollbar.config(command=self.texto.yview)
+
+        self.boton_cerrar = tk.Button(self.root, text="Cerrar",
+                                       command=self.root.destroy, state="disabled")
+        self.boton_cerrar.pack(pady=(0, 10))
+
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close_intentado)
+
+    def _on_close_intentado(self):
+        # Evita que cierren la ventana a medias mientras esta trabajando
+        if self.boton_cerrar["state"] == "normal":
+            self.root.destroy()
+
+    def estado(self, texto):
+        self.estado_var.set(texto)
+        self.root.update_idletasks()
+        self.root.update()
+
+    def log(self, mensaje):
+        self.texto.insert("end", str(mensaje) + "\n")
+        self.texto.see("end")
+        self.root.update_idletasks()
+        self.root.update()
+
+    def terminar(self, exito=True):
+        self.estado("Completado" if exito else "Termino con errores")
+        self.boton_cerrar.config(state="normal")
+
+    def iniciar_loop(self):
+        self.root.mainloop()
 
 
 def cargar_parametros(ruta_json):
@@ -55,7 +122,7 @@ def limpiar_nombre_tag(tag):
     return tag
 
 
-def extraer_series(params):
+def extraer_series(params, ui):
     """Se conecta a PI y extrae cada tag. Devuelve una lista de
     (tag, [(datetime, valor), ...]) -- solo en memoria, sin CSV
     intermedios por tag."""
@@ -64,22 +131,22 @@ def extraer_series(params):
     utc_start = params["start_utc_seconds"]
     utc_end = params["end_utc_seconds"]
 
-    print("=== Conectando a PI ===")
-    print(f"Servidor: {servidor_nombre}")
-    print(f"Tags a extraer: {len(tags)}")
+    ui.log(f"Servidor: {servidor_nombre}")
+    ui.log(f"Tags a extraer: {len(tags)}")
+    ui.estado("Conectando a PI...")
 
     try:
         pisdk = win32com.client.Dispatch("PISDK.PISDK")
     except Exception as e:
-        print(f"ERROR: no se pudo crear el objeto PISDK.PISDK. "
-              f"Verifica que PI-SDK este instalado en esta maquina.\n{e}")
-        sys.exit(1)
+        ui.log(f"ERROR: no se pudo crear el objeto PISDK.PISDK. "
+               f"Verifica que PI-SDK este instalado en esta maquina.\n{e}")
+        return []
 
     try:
         server = pisdk.Servers(servidor_nombre)
     except Exception as e:
-        print(f"ERROR: no se pudo conectar al servidor '{servidor_nombre}'.\n{e}")
-        sys.exit(1)
+        ui.log(f"ERROR: no se pudo conectar al servidor '{servidor_nombre}'.\n{e}")
+        return []
 
     ts_start = win32com.client.Dispatch("PITimeServer.PITime")
     ts_end = win32com.client.Dispatch("PITimeServer.PITime")
@@ -87,21 +154,21 @@ def extraer_series(params):
     ts_end.UTCSeconds = utc_end
 
     series = []
-    print("\n=== Extrayendo trazas ===")
+    ui.log("\n=== Extrayendo trazas ===")
     for i, tag_raw in enumerate(tags, start=1):
         tag = limpiar_nombre_tag(tag_raw)
-        print(f"[{i}/{len(tags)}] {tag} ...", end=" ")
+        ui.estado(f"Extrayendo {i}/{len(tags)}: {tag}")
 
         try:
             point = server.PIPoints(tag)
         except Exception:
-            print("TAG NO ENCONTRADO -- se omite")
+            ui.log(f"[{i}/{len(tags)}] {tag}: TAG NO ENCONTRADO -- se omite")
             continue
 
         try:
             values = point.Data.RecordedValues(ts_start, ts_end)
         except Exception as e:
-            print(f"ERROR ({e}) -- se omite")
+            ui.log(f"[{i}/{len(tags)}] {tag}: ERROR ({e}) -- se omite")
             continue
 
         puntos = []
@@ -109,7 +176,6 @@ def extraer_series(params):
             try:
                 ts_local = datetime.strptime(str(v.TimeStamp.LocalDate), "%m/%d/%Y %I:%M:%S %p")
             except ValueError:
-                # respaldo por si el formato de LocalDate varia segun locale/version
                 try:
                     ts_local = pd.to_datetime(str(v.TimeStamp.LocalDate))
                 except Exception:
@@ -120,21 +186,22 @@ def extraer_series(params):
                 continue
             puntos.append((ts_local, val))
 
-        print(f"{len(puntos)} puntos")
+        ui.log(f"[{i}/{len(tags)}] {tag}: {len(puntos)} puntos")
         if puntos:
             series.append((tag, puntos))
 
     return series
 
 
-def combinar_series(series):
+def combinar_series(series, ui):
     """Combina las series extraidas en una sola tabla, alineando
     por 'ultimo valor real conocido' (igual que PI Trend), con
     relleno hacia atras (backfill) al inicio de cada serie."""
-    print("\n=== Combinando series ===")
+    ui.estado("Combinando series...")
+    ui.log("\n=== Combinando series ===")
 
     if not series:
-        print("No hay series validas para combinar.")
+        ui.log("No hay series validas para combinar.")
         return None
 
     filas_largo = []
@@ -154,45 +221,77 @@ def combinar_series(series):
     resultado = pivot.reset_index()
     resultado.columns.name = None
 
-    print(f"Filas combinadas: {len(resultado)}")
-    print(f"Columnas (tags): {len(resultado.columns) - 1}")
+    ui.log(f"Filas combinadas: {len(resultado)}")
+    ui.log(f"Columnas (tags): {len(resultado.columns) - 1}")
 
     return resultado
 
 
+def trabajo_principal(ui, ruta_json, carpeta_salida):
+    """Corre en un hilo aparte para no congelar la ventana."""
+    try:
+        if win32com is None:
+            ui.log("ERROR: falta pywin32 en este build.")
+            ui.terminar(exito=False)
+            return
+        if pd is None:
+            ui.log("ERROR: falta pandas en este build.")
+            ui.terminar(exito=False)
+            return
+
+        params = cargar_parametros(ruta_json)
+        series = extraer_series(params, ui)
+        resultado = combinar_series(series, ui)
+
+        if resultado is None:
+            ui.log("No se genero ningun archivo (sin datos validos).")
+            ui.terminar(exito=False)
+            return
+
+        nombre_salida = f"Combinado_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        ruta_salida = os.path.join(carpeta_salida, nombre_salida)
+        resultado.to_csv(ruta_salida, index=False, encoding="utf-8")
+
+        ui.log(f"\n=== LISTO ===")
+        ui.log(f"Archivo combinado: {ruta_salida}")
+        ui.terminar(exito=True)
+
+        try:
+            os.startfile(ruta_salida)
+        except Exception:
+            pass
+
+    except Exception as e:
+        ui.log(f"\nERROR INESPERADO: {e}")
+        ui.terminar(exito=False)
+
+
 def main():
     if len(sys.argv) < 2:
-        print("ABSPIEXCELEXTRACT")
-        print("Uso: ABSPIEXCELEXTRACT.exe <archivo_parametros.json> [carpeta_salida]")
-        input("\nPresiona Enter para salir...")
+        root = tk.Tk()
+        root.withdraw()
+        messagebox.showerror(
+            "ABSPIEXCELEXTRACT",
+            "Uso: ABSPIEXCELEXTRACT.exe <archivo_parametros.json> [carpeta_salida]"
+        )
         sys.exit(1)
 
     ruta_json = sys.argv[1]
     if not os.path.isfile(ruta_json):
-        print(f"ERROR: no se encontro el archivo {ruta_json}")
-        input("\nPresiona Enter para salir...")
+        root = tk.Tk()
+        root.withdraw()
+        messagebox.showerror("ABSPIEXCELEXTRACT", f"No se encontro el archivo:\n{ruta_json}")
         sys.exit(1)
 
     carpeta_salida = sys.argv[2] if len(sys.argv) > 2 else os.path.dirname(os.path.abspath(ruta_json))
     os.makedirs(carpeta_salida, exist_ok=True)
 
-    params = cargar_parametros(ruta_json)
+    ui = VentanaProgreso()
 
-    series = extraer_series(params)
-    resultado = combinar_series(series)
+    hilo = threading.Thread(target=trabajo_principal, args=(ui, ruta_json, carpeta_salida), daemon=True)
+    hilo.start()
 
-    if resultado is None:
-        print("No se genero ningun archivo (sin datos validos).")
-        input("\nPresiona Enter para salir...")
-        sys.exit(1)
-
-    nombre_salida = f"Combinado_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
-    ruta_salida = os.path.join(carpeta_salida, nombre_salida)
-    resultado.to_csv(ruta_salida, index=False, encoding="utf-8")
-
-    print(f"\n=== LISTO ===")
-    print(f"Archivo combinado: {ruta_salida}")
-    input("\nPresiona Enter para salir...")
+    ui.iniciar_loop()
 
 
 if __name__ == "__main__":
