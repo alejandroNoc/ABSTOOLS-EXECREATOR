@@ -1,74 +1,53 @@
 """
-ABSPIEXCELEXTRACT - Extractor + Combinador de datos PI
+ABSPIEXCELEXTRACT - Combinador de CSVs de PI
 
-A partir de un archivo de parametros JSON generado por la macro VBA
-"GenerarParametrosExtraccion", hace en un solo paso:
-  1. Lanza un script PowerShell (generado internamente, embebido en
-     este mismo archivo) que se conecta a PI-SDK via COM NATIVO de
-     Windows y extrae cada tag con timestamps reales -- exactamente
-     el mismo mecanismo que usaba la macro VBA (New-Object -ComObject,
-     igual que "CreateObject"/"New" en VBA). Se uso PowerShell para la
-     extraccion en vez de Python/pywin32 porque, tras varias pruebas,
-     pywin32 (tanto con gencache/enlace temprano como con Dispatch/
-     enlace tardio) no logra pasar objetos PITime como argumento de
-     RecordedValues() de forma confiable dentro de un .exe compilado
-     con PyInstaller -- falla con "The Python instance can not be
-     converted to a COM object" o con errores de cache de tipos
-     ("No module named win32com.gen_py..."). PowerShell usa COM nativo
-     de Windows (igual que VBA), sin esa capa fragil.
-  2. El script de PowerShell escribe un CSV individual por tag
-     (formato TAGn_nombre_conteo.csv, columnas Timestamp,Valor,Tag).
-  3. Python lee esos CSV y combina todo en una sola tabla, con el
-     mismo enfoque "forward-fill + backfill" ya validado (pivot por
-     Tag, sin inventar fechas) -- esta parte SI funciona perfecto en
-     Python/pandas, no tiene relacion con COM.
-  4. Escribe un unico CSV combinado, listo para usar.
+Este programa NO extrae datos de PI ni toca COM para nada -- esa
+parte la hace la macro VBA "GenerarParametrosExtraccion" de forma
+nativa (New/CreateObject de PISDK.PISDK y PITimeServer.PITime desde
+VBA, con referencias tempranas), escribiendo un CSV individual por
+tag (formato TAGn_nombre_conteo.csv, columnas Timestamp,Valor,Tag)
+en una carpeta.
 
-Si se abre con DOBLE CLIC (sin argumentos de linea de comandos),
-pregunta si se quiere:
-  - Abrir un archivo de parametros .json (extrae de PI y combina), o
-  - Abrir una carpeta con CSV ya existentes (solo combina, sin PI --
-    util si ya se habian extraido los tags en otra corrida y solo
-    hace falta rearmar el combinado).
+Historial: se probaron dos rutas para hacer la extraccion desde este
+.exe (Python con pywin32, y PowerShell embebido) y ambas fallaron en
+distintas maquinas por razones fuera de nuestro control:
+  - pywin32 (gencache y Dispatch normal) no logra pasar objetos
+    PITime como argumento de RecordedValues() de forma confiable
+    dentro de un .exe compilado con PyInstaller.
+  - PowerShell esta bloqueado por politica de grupo en algunas
+    maquinas ("This program is blocked by group policy").
+VBA, en cambio, usa COM nativo sin ninguna de esas capas y siempre
+funciono bien -- por eso la extraccion se dejo ahi, y este .exe se
+redujo a SOLO combinar (leer CSVs + pandas), que nunca tuvo problemas.
+
+Este programa:
+  1. Lee todos los CSV (formato Timestamp,Valor,Tag) de una carpeta.
+  2. Combina todas las series en una sola tabla, con el enfoque
+     "forward-fill + backfill" (pivot por Tag, sin inventar fechas,
+     manteniendo el ultimo valor real conocido como hace PI Trend).
+  3. Escribe un unico CSV combinado, listo para usar, y lo abre solo.
+
+Si se abre con DOBLE CLIC (sin argumentos), pregunta la carpeta con
+los CSV a combinar.
 
 Muestra una ventanita de progreso (Tkinter) con el avance en vivo,
 para poder compilarse con --noconsole y aun asi ver que esta pasando.
-
-Requisitos en la maquina que EJECUTA el .exe:
-  - PI-SDK instalado (provee los objetos COM "PISDK.PISDK" y
-    "PITimeServer.PITime" que usa el script de PowerShell).
-  - PowerShell 5.1+ (viene por defecto en Windows 10/11 y Server
-    2016+, asi que en la practica no requiere instalar nada extra).
-  - pandas (para la combinacion; se compila dentro del .exe).
 
 Requisitos para COMPILAR (no para el usuario final):
     pip install pandas pyinstaller
     pyinstaller --onefile --noconsole --name ABSPIEXCELEXTRACT ABSPIEXCELEXTRACT.py
 
-Ya NO se requiere pywin32 para compilar (la extraccion via PI-SDK
-ahora la hace PowerShell, no Python).
-
 Este .exe debe quedar instalado en: C:\\ABSTOOLS\\ABSPIEXCELEXTRACT.exe
 (esa es la ruta que espera el modulo VBA "GenerarParametrosExtraccion"
-si el usuario elige lanzarlo automaticamente desde ProcessBook).
+si el usuario elige lanzarlo automaticamente al terminar de extraer).
 
-Uso con doble clic: se abre el dialogo de seleccion descrito arriba.
-
-Uso por linea de comandos (para el lanzamiento automatico desde VBA,
-o manual): el primer argumento puede ser un archivo .json (modo
-extraer+combinar) o una carpeta con CSV ya existentes (modo solo
-combinar) -- se detecta automaticamente segun cual sea:
-    ABSPIEXCELEXTRACT.exe parametros_extraccion_XXXX.json [carpeta_salida]
+Uso por linea de comandos (lanzado desde VBA, o manual):
     ABSPIEXCELEXTRACT.exe "C:\\ruta\\carpeta_con_csvs" [carpeta_salida]
 """
 import sys
 import os
-import json
 import csv
 import threading
-import subprocess
-import tempfile
-import re
 from datetime import datetime
 
 try:
@@ -81,142 +60,13 @@ from tkinter import messagebox
 from tkinter import ttk
 
 
-# ============================================================
-# Script de PowerShell embebido: hace la extraccion de PI usando
-# COM nativo de Windows (New-Object -ComObject), igual que VBA.
-# Se escribe a un archivo temporal en tiempo de ejecucion y se
-# invoca con subprocess -- asi no depende de --add-data de
-# PyInstaller ni de rutas relativas al .exe.
-# ============================================================
-_POWERSHELL_SCRIPT = r'''
-param(
-    [Parameter(Mandatory=$true)][string]$ParamsJson,
-    [Parameter(Mandatory=$true)][string]$OutFolder
-)
-
-$ErrorActionPreference = "Stop"
-
-function Limpiar-NombreTag($tag) {
-    if ($tag -match '\\') {
-        $partes = $tag -split '\\'
-        return $partes[$partes.Count - 1]
-    }
-    return $tag
-}
-
-function Limpiar-NombreArchivo($nombre) {
-    $invalidos = @(':','\','/','*','?','"','<','>','|')
-    $r = $nombre
-    foreach ($ch in $invalidos) { $r = $r.Replace($ch, '_') }
-    return $r
-}
-
-Write-Output "LOG:Leyendo parametros..."
-$paramsRaw = Get-Content -Raw -Path $ParamsJson
-$params = $paramsRaw | ConvertFrom-Json
-
-$servidor = $params.server
-$tags = $params.tags
-$utcStart = [double]$params.start_utc_seconds
-$utcEnd = [double]$params.end_utc_seconds
-
-Write-Output "LOG:Servidor: $servidor"
-Write-Output "LOG:Tags a extraer: $($tags.Count)"
-
-try {
-    $piSDK = New-Object -ComObject "PISDK.PISDK"
-} catch {
-    Write-Output "LOG:ERROR: no se pudo crear el objeto PISDK.PISDK. Verifica que PI-SDK este instalado en esta maquina."
-    Write-Output "LOG:$($_.Exception.Message)"
-    exit 1
-}
-
-try {
-    $piServer = $piSDK.Servers.Item($servidor)
-} catch {
-    Write-Output "LOG:ERROR: no se pudo conectar al servidor '$servidor'."
-    Write-Output "LOG:$($_.Exception.Message)"
-    exit 1
-}
-
-$tsStart = New-Object -ComObject "PITimeServer.PITime"
-$tsEnd = New-Object -ComObject "PITimeServer.PITime"
-$tsStart.UTCSeconds = $utcStart
-$tsEnd.UTCSeconds = $utcEnd
-
-if (!(Test-Path $OutFolder)) { New-Item -ItemType Directory -Path $OutFolder | Out-Null }
-
-$i = 0
-$total = $tags.Count
-foreach ($tagRaw in $tags) {
-    $i++
-    $tag = Limpiar-NombreTag $tagRaw
-    $nombreSeguro = Limpiar-NombreArchivo $tag
-    Write-Output "PROGRESO:$i/$total"
-    Write-Output "LOG:[$i/$total] Extrayendo: $tag"
-
-    $piPoint = $null
-    try {
-        $piPoint = $piServer.PIPoints.Item($tag)
-    } catch {
-        $piPoint = $null
-    }
-
-    if ($null -eq $piPoint) {
-        $ruta = Join-Path $OutFolder "TAG${i}_${nombreSeguro}_0.csv"
-        $sw = New-Object System.IO.StreamWriter($ruta, $false, [System.Text.Encoding]::UTF8)
-        $sw.WriteLine("Timestamp,Valor,Tag")
-        $sw.WriteLine(",,`"TAG NO ENCONTRADO: $tag`"")
-        $sw.Close()
-        Write-Output "LOG:[$i/$total] $tag : TAG NO ENCONTRADO"
-        continue
-    }
-
-    $piValues = $null
-    try {
-        $piValues = $piPoint.Data.RecordedValues($tsStart, $tsEnd)
-    } catch {
-        $ruta = Join-Path $OutFolder "TAG${i}_${nombreSeguro}_0.csv"
-        $sw = New-Object System.IO.StreamWriter($ruta, $false, [System.Text.Encoding]::UTF8)
-        $sw.WriteLine("Timestamp,Valor,Tag")
-        $sw.WriteLine(",,`"ERROR: $($_.Exception.Message)`"")
-        $sw.Close()
-        Write-Output "LOG:[$i/$total] $tag : ERROR ($($_.Exception.Message))"
-        continue
-    }
-
-    $conteo = $piValues.Count
-    $ruta = Join-Path $OutFolder "TAG${i}_${nombreSeguro}_${conteo}.csv"
-
-    $sw = New-Object System.IO.StreamWriter($ruta, $false, [System.Text.Encoding]::UTF8)
-    $sw.WriteLine("Timestamp,Valor,Tag")
-    foreach ($v in $piValues) {
-        try {
-            $ts = [datetime]$v.TimeStamp.LocalDate
-            $tsStr = $ts.ToString("yyyy-MM-dd HH:mm:ss")
-            $sw.WriteLine("$tsStr,$($v.Value),`"$tag`"")
-        } catch {
-            # fila individual con dato raro -- se salta, no se aborta todo el tag
-            continue
-        }
-    }
-    $sw.Close()
-
-    Write-Output "LOG:[$i/$total] $tag : $conteo puntos exportados"
-}
-
-Write-Output "LOG:=== EXTRACCION COMPLETADA ==="
-'''
-
-
 class VentanaProgreso:
     """Ventanita de progreso: titulo, barra de estado (texto), barra
     de progreso visual (determinate mientras se conoce el total --
-    tag por tag, archivo por archivo -- e indeterminate/animada
-    durante la combinacion, que es una operacion vectorizada sin
-    pasos individuales que mostrar), y una caja de texto tipo log.
-    No usa mainloop() de forma bloqueante -- se actualiza manualmente
-    con update() desde el hilo de trabajo."""
+    archivo por archivo -- e indeterminate/animada durante el pivot,
+    que es una operacion vectorizada sin pasos individuales), y una
+    caja de texto tipo log. No usa mainloop() de forma bloqueante --
+    se actualiza manualmente con update() desde el hilo de trabajo."""
 
     def __init__(self):
         self.root = tk.Tk()
@@ -233,7 +83,6 @@ class VentanaProgreso:
                                font=("Segoe UI", 10))
         estado_lbl.pack(pady=(4, 6))
 
-        # --- Barra de progreso visual ---
         barra_frame = tk.Frame(self.root)
         barra_frame.pack(fill="x", padx=12, pady=(0, 4))
 
@@ -313,91 +162,11 @@ class VentanaProgreso:
         self.root.mainloop()
 
 
-def cargar_parametros(ruta_json):
-    with open(ruta_json, "r", encoding="utf-8") as f:
-        return json.load(f)
-
-
-def limpiar_nombre_para_archivo(nombre_tag):
-    invalidos = [":", "\\", "/", "*", "?", '"', "<", ">", "|"]
-    r = nombre_tag
-    for ch in invalidos:
-        r = r.replace(ch, "_")
-    return r
-
-
-def extraer_via_powershell(ruta_json, carpeta_salida, ui):
-    """Escribe el script de PowerShell embebido a un archivo temporal
-    y lo ejecuta, leyendo su salida linea por linea para actualizar
-    el log y la barra de progreso en vivo. La extraccion real de PI
-    ocurre DENTRO del proceso de PowerShell (COM nativo de Windows,
-    igual que hacia la macro VBA) -- Python solo orquesta y muestra
-    el avance, sin tocar COM para nada."""
-    fd, ruta_ps1 = tempfile.mkstemp(suffix=".ps1", prefix="abspiexcelextract_")
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            f.write(_POWERSHELL_SCRIPT)
-
-        cmd = [
-            "powershell.exe",
-            "-NoProfile",
-            "-ExecutionPolicy", "Bypass",
-            "-File", ruta_ps1,
-            "-ParamsJson", ruta_json,
-            "-OutFolder", carpeta_salida,
-        ]
-
-        ui.estado("Conectando a PI (via PowerShell)...")
-
-        proceso = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            bufsize=1,
-            creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0,
-        )
-
-        patron_progreso = re.compile(r"^PROGRESO:(\d+)/(\d+)$")
-
-        for linea in proceso.stdout:
-            linea = linea.rstrip("\n").rstrip("\r")
-            if not linea:
-                continue
-
-            m = patron_progreso.match(linea)
-            if m:
-                actual, total = int(m.group(1)), int(m.group(2))
-                ui.progreso(actual, total)
-                continue
-
-            if linea.startswith("LOG:"):
-                mensaje = linea[4:]
-                ui.log(mensaje)
-                if mensaje.startswith("[") and "Extrayendo:" in mensaje:
-                    ui.estado(mensaje.lstrip("LOG:"))
-                continue
-
-            # cualquier otra linea (por si PowerShell escribe algo inesperado)
-            ui.log(linea)
-
-        proceso.wait()
-
-        if proceso.returncode != 0:
-            ui.log(f"\nEl proceso de extraccion (PowerShell) termino con codigo {proceso.returncode}.")
-
-    finally:
-        try:
-            os.remove(ruta_ps1)
-        except Exception:
-            pass
-
-
 def leer_csv_individual(ruta_csv):
     """Lee un CSV individual (formato Timestamp,Valor,Tag) generado
-    por el script de PowerShell o por la macro VBA. Devuelve (tag,
-    puntos), con puntos vacio si el archivo no tiene datos utilizables
-    (tag no encontrado, error, o vacio)."""
+    por la macro VBA. Devuelve (tag, puntos), con puntos vacio si el
+    archivo no tiene datos utilizables (tag no encontrado, error, o
+    vacio). Acepta varios formatos de fecha comunes."""
     tag = os.path.splitext(os.path.basename(ruta_csv))[0]
     puntos = []
     tag_real = None
@@ -444,12 +213,9 @@ def leer_csv_individual(ruta_csv):
 
 
 def combinar_desde_carpeta(carpeta, ui):
-    """Modo 'solo combinar': lee todos los CSV individuales (formato
-    TAGn_nombre_conteo.csv, o cualquier CSV con columnas
-    Timestamp,Valor,Tag) que ya existan en una carpeta, y arma la
-    lista 'series' que espera combinar_series(). Tambien se usa
-    despues del modo 'extraer', para leer los CSV que escribio el
-    script de PowerShell."""
+    """Lee todos los CSV (formato TAGn_nombre_conteo.csv, o cualquier
+    CSV con columnas Timestamp,Valor,Tag) que existan en una carpeta,
+    y arma la lista 'series' que espera combinar_series()."""
     archivos = [f for f in os.listdir(carpeta)
                 if f.lower().endswith(".csv") and not f.lower().startswith("combinado")]
 
@@ -457,7 +223,7 @@ def combinar_desde_carpeta(carpeta, ui):
         ui.log("No se encontraron archivos CSV en la carpeta.")
         return []
 
-    ui.log(f"\nLeyendo {len(archivos)} archivos CSV para combinar...\n")
+    ui.log(f"Encontrados {len(archivos)} archivos CSV en la carpeta.\n")
 
     series = []
     ui.progreso(0, len(archivos))
@@ -465,6 +231,7 @@ def combinar_desde_carpeta(carpeta, ui):
         ruta = os.path.join(carpeta, nombre)
         ui.estado(f"Leyendo {i}/{len(archivos)}: {nombre}")
         tag, puntos = leer_csv_individual(ruta)
+        ui.log(f"[{i}/{len(archivos)}] {nombre} -> tag='{tag}', {len(puntos)} puntos")
         if puntos:
             series.append((tag, puntos))
         ui.progreso(i, len(archivos))
@@ -473,9 +240,9 @@ def combinar_desde_carpeta(carpeta, ui):
 
 
 def combinar_series(series, ui):
-    """Combina las series extraidas en una sola tabla, alineando
-    por 'ultimo valor real conocido' (igual que PI Trend), con
-    relleno hacia atras (backfill) al inicio de cada serie."""
+    """Combina las series en una sola tabla, alineando por 'ultimo
+    valor real conocido' (igual que PI Trend), con relleno hacia
+    atras (backfill) al inicio de cada serie."""
     ui.estado("Combinando series...")
     ui.log("\n=== Combinando series ===")
 
@@ -517,30 +284,20 @@ def combinar_series(series, ui):
     return resultado
 
 
-def trabajo_principal(ui, modo, ruta_entrada, carpeta_salida):
-    """Corre en un hilo aparte para no congelar la ventana.
-    modo = 'extraer' (ruta_entrada es un JSON de parametros: lanza
-           PowerShell para extraer de PI, y luego combina) o
-           'combinar' (ruta_entrada es una carpeta con CSV ya
-           existentes: solo los lee y combina, sin tocar PI)."""
+def trabajo_principal(ui, carpeta_entrada, carpeta_salida):
+    """Corre en un hilo aparte para no congelar la ventana. No toca
+    COM/PI para nada -- solo lee CSVs de disco y combina con pandas."""
     try:
         if pd is None:
             ui.log("ERROR: falta pandas en este build.")
             ui.terminar(exito=False)
             return
 
-        if modo == "extraer":
-            extraer_via_powershell(ruta_entrada, carpeta_salida, ui)
-            series = combinar_desde_carpeta(carpeta_salida, ui)
-        else:  # modo == "combinar"
-            series = combinar_desde_carpeta(ruta_entrada, ui)
-
+        series = combinar_desde_carpeta(carpeta_entrada, ui)
         resultado = combinar_series(series, ui)
 
         if resultado is None:
             ui.log("No se genero ningun archivo combinado (sin datos validos).")
-            if modo == "extraer":
-                ui.log(f"Revisa los CSV individuales por tag en: {carpeta_salida}")
             ui.terminar(exito=False)
             return
 
@@ -549,8 +306,6 @@ def trabajo_principal(ui, modo, ruta_entrada, carpeta_salida):
         resultado.to_csv(ruta_salida, index=False, encoding="utf-8")
 
         ui.log(f"\n=== LISTO ===")
-        if modo == "extraer":
-            ui.log(f"CSV individuales por tag: {carpeta_salida}")
         ui.log(f"Archivo combinado: {ruta_salida}")
         ui.terminar(exito=True)
 
@@ -564,72 +319,38 @@ def trabajo_principal(ui, modo, ruta_entrada, carpeta_salida):
         ui.terminar(exito=False)
 
 
-def elegir_entrada_con_dialogo():
+def elegir_carpeta_con_dialogo():
     """Se muestra solo cuando el .exe se abre con doble clic (sin
-    argumentos de linea de comandos)."""
+    argumentos de linea de comandos): pide la carpeta con los CSV."""
     from tkinter import filedialog
 
     root = tk.Tk()
     root.withdraw()
-
-    opcion = messagebox.askyesnocancel(
-        "ABSPIEXCELEXTRACT",
-        "Que queres hacer?\n\n"
-        "SI = Abrir un archivo de parametros (.json) -> extrae de PI y combina\n"
-        "NO = Abrir una carpeta con CSV ya existentes -> solo combina\n"
-        "CANCELAR = Salir"
-    )
-
-    if opcion is None:
-        root.destroy()
-        return None, None, None
-
-    if opcion:  # Si -> JSON
-        ruta_json = filedialog.askopenfilename(
-            title="Selecciona el archivo de parametros (.json)",
-            filetypes=[("Archivos JSON", "*.json"), ("Todos los archivos", "*.*")]
-        )
-        root.destroy()
-        if not ruta_json:
-            return None, None, None
-        carpeta_salida = os.path.dirname(os.path.abspath(ruta_json))
-        return "extraer", ruta_json, carpeta_salida
-    else:  # No -> carpeta con CSV
-        carpeta = filedialog.askdirectory(
-            title="Selecciona la carpeta con los CSV ya extraidos"
-        )
-        root.destroy()
-        if not carpeta:
-            return None, None, None
-        return "combinar", carpeta, carpeta
+    carpeta = filedialog.askdirectory(title="Selecciona la carpeta con los CSV de PI a combinar")
+    root.destroy()
+    return carpeta if carpeta else None
 
 
 def main():
     if len(sys.argv) >= 2:
-        ruta_entrada = sys.argv[1]
-
-        if os.path.isdir(ruta_entrada):
-            modo = "combinar"
-            carpeta_salida = sys.argv[2] if len(sys.argv) > 2 else ruta_entrada
-        elif os.path.isfile(ruta_entrada):
-            modo = "extraer"
-            carpeta_salida = sys.argv[2] if len(sys.argv) > 2 else os.path.dirname(os.path.abspath(ruta_entrada))
-        else:
+        carpeta_entrada = sys.argv[1]
+        if not os.path.isdir(carpeta_entrada):
             root = tk.Tk()
             root.withdraw()
-            messagebox.showerror("ABSPIEXCELEXTRACT",
-                                  f"No se encontro el archivo ni la carpeta:\n{ruta_entrada}")
+            messagebox.showerror("ABSPIEXCELEXTRACT", f"No se encontro la carpeta:\n{carpeta_entrada}")
             sys.exit(1)
+        carpeta_salida = sys.argv[2] if len(sys.argv) > 2 else carpeta_entrada
     else:
-        modo, ruta_entrada, carpeta_salida = elegir_entrada_con_dialogo()
-        if modo is None:
+        carpeta_entrada = elegir_carpeta_con_dialogo()
+        if not carpeta_entrada:
             sys.exit(0)
+        carpeta_salida = carpeta_entrada
 
     os.makedirs(carpeta_salida, exist_ok=True)
 
     ui = VentanaProgreso()
 
-    hilo = threading.Thread(target=trabajo_principal, args=(ui, modo, ruta_entrada, carpeta_salida), daemon=True)
+    hilo = threading.Thread(target=trabajo_principal, args=(ui, carpeta_entrada, carpeta_salida), daemon=True)
     hilo.start()
 
     ui.iniciar_loop()
