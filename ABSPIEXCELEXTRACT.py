@@ -90,18 +90,46 @@ _cache_com_dir = None  # se completa en main() -> _preparar_cache_com()
 
 
 def _limpiar_cache_com(cache_dir):
-    """Borra la carpeta de cache de tipos COM (gen_py). Se usa cuando
-    EnsureDispatch falla con 'No module named win32com.gen_py....' --
-    esto pasa si la cache quedo corrupta o desincronizada (ej. el .exe
-    se actualizo/recompilo y la cache vieja en %TEMP% ya no coincide).
-    Borrarla fuerza que se regenere limpia en el siguiente intento."""
-    if not cache_dir or not os.path.isdir(cache_dir):
-        return
+    """Borra la carpeta de cache de tipos COM (gen_py) Y limpia las
+    referencias en memoria (sys.modules, registro interno de gencache).
+    Solo borrar el archivo en disco NO alcanza: dentro del mismo proceso,
+    Python ya dejo una referencia rota en sys.modules tras el primer
+    intento fallido, y EnsureDispatch la sigue usando aunque el archivo
+    ya no exista en disco -- por eso hay que limpiar tambien la memoria
+    antes de reintentar."""
     import shutil
-    try:
-        shutil.rmtree(cache_dir, ignore_errors=True)
-    except Exception:
-        pass
+    import importlib
+
+    # 1) Borrar del disco
+    if cache_dir and os.path.isdir(cache_dir):
+        try:
+            shutil.rmtree(cache_dir, ignore_errors=True)
+        except Exception:
+            pass
+        try:
+            os.makedirs(cache_dir, exist_ok=True)
+        except Exception:
+            pass
+
+    # 2) Quitar del cache de modulos ya importados en este proceso
+    for nombre in list(sys.modules.keys()):
+        if nombre.startswith("win32com.gen_py"):
+            del sys.modules[nombre]
+
+    # 3) Resetear el registro interno de gencache (que "recuerda" que
+    # ya genero/importo ese tipo, aunque haya fallado). Se hace atributo
+    # por atributo con try/except individual, por si alguno no existe
+    # en la version de pywin32 instalada (no debe tumbar el reintento).
+    for attr in ("dict", "dict_class_to_typelib", "clsidToPackageMap"):
+        try:
+            getattr(win32com.client.gencache, attr).clear()
+        except Exception:
+            pass
+
+    # 4) Invalidar el cache de importacion de Python, para que vuelva
+    # a mirar el disco (con la carpeta ya vacia/regenerada) en vez de
+    # asumir que ya sabe que hay ahi
+    importlib.invalidate_caches()
 
 
 class VentanaProgreso:
