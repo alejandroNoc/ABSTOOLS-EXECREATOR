@@ -165,12 +165,24 @@ class VentanaProgreso:
         self.root.update_idletasks()
         self.root.update()
 
-    def terminar(self, exito=True):
+    def terminar(self, exito=True, resumen=None):
+        """Marca el trabajo como terminado. Si exito=True y se paso un
+        'resumen' (texto con la info del trabajo), muestra un MsgBox
+        con ese resumen y, al aceptar, CIERRA toda la ventana (la
+        aplicacion termina ahi mismo, sin necesitar boton 'Cerrar'
+        aparte). Si hubo error, deja el log visible y habilita el
+        boton 'Cerrar' para que el usuario revise que paso antes de
+        cerrar manualmente."""
         self.progreso_indeterminado(False)
         self.progress["value"] = self.progress["maximum"] if exito else 0
         self.progress_pct_var.set("100%" if exito else "")
         self.estado("Completado" if exito else "Termino con errores")
-        self.boton_cerrar.config(state="normal")
+
+        if exito and resumen:
+            messagebox.showinfo("ABSPIEXCELEXTRACT - Completado", resumen, parent=self.root)
+            self.root.destroy()
+        else:
+            self.boton_cerrar.config(state="normal")
 
     def preguntar_formato_salida(self):
         """Pregunta como quiere el usuario el CSV combinado:
@@ -313,13 +325,19 @@ def combinar_series(series, ui):
     total_puntos = sum(len(puntos) for _, puntos in series)
     filas_largo = []
     procesados = 0
+    # Actualizar la barra cada cierto numero de puntos (no solo una vez
+    # por tag) para que el avance se vea fluido incluso con tags que
+    # tienen muchisimos puntos.
+    intervalo_actualizacion = max(1, total_puntos // 200)
     ui.estado("Combinando series: preparando datos...")
     ui.progreso(0, total_puntos)
     for tag, puntos in series:
         for ts, val in puntos:
             filas_largo.append({"Timestamp": ts, "Valor": val, "Tag": tag})
             procesados += 1
-        ui.progreso(procesados, total_puntos)
+            if procesados % intervalo_actualizacion == 0:
+                ui.progreso(procesados, total_puntos)
+    ui.progreso(procesados, total_puntos)
 
     ui.estado("Combinando series: alineando por tiempo...")
     ui.progreso_indeterminado(True)
@@ -392,27 +410,46 @@ def trabajo_principal(ui, carpeta_entrada, carpeta_salida):
             return
 
         archivo_a_abrir = None
+        archivos_generados = []
 
         if formato in ("completo", "ambos"):
             ruta_completo = os.path.join(carpeta_salida, f"{nombre_base}.csv")
             resultado.to_csv(ruta_completo, index=False, encoding="utf-8")
             ui.log(f"\nArchivo completo: {ruta_completo} ({len(resultado)} filas)")
             archivo_a_abrir = ruta_completo
+            archivos_generados.append(os.path.basename(ruta_completo))
 
         if formato in ("fragmentado", "ambos"):
             ui.log(f"\nGenerando archivos fragmentados (limite {LIMITE_FILAS_EXCEL} filas c/u)...")
             rutas_frag = escribir_csv_fragmentado(resultado, carpeta_salida, nombre_base, ui)
             if archivo_a_abrir is None and rutas_frag:
                 archivo_a_abrir = rutas_frag[0]
+            archivos_generados.extend(os.path.basename(r) for r in rutas_frag)
 
         ui.log(f"\n=== LISTO ===")
-        ui.terminar(exito=True)
 
         if archivo_a_abrir:
             try:
                 os.startfile(archivo_a_abrir)
             except Exception:
                 pass
+
+        # --- Armar el resumen para el MsgBox final ---
+        nombres_formato = {"completo": "Completo (1 archivo)",
+                            "fragmentado": "Fragmentado (para Excel)",
+                            "ambos": "Ambos (completo + fragmentado)"}
+        lista_archivos = "\n".join(f"  - {n}" for n in archivos_generados)
+        resumen = (
+            f"Combinacion completada.\n\n"
+            f"Tags combinados: {len(series)}\n"
+            f"Filas: {len(resultado)}\n"
+            f"Columnas (tags): {len(resultado.columns) - 1}\n"
+            f"Formato: {nombres_formato.get(formato, formato)}\n\n"
+            f"Archivo(s) generado(s):\n{lista_archivos}\n\n"
+            f"Carpeta: {carpeta_salida}"
+        )
+
+        ui.terminar(exito=True, resumen=resumen)
 
     except Exception as e:
         ui.log(f"\nERROR INESPERADO: {e}")
