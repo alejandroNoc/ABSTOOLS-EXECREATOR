@@ -37,9 +37,12 @@ si el usuario elige lanzarlo automaticamente desde ProcessBook).
 
 Uso con doble clic: se abre el dialogo de seleccion descrito arriba.
 
-Uso por linea de comandos (igual que antes, para el lanzamiento
-automatico desde VBA):
+Uso por linea de comandos (para el lanzamiento automatico desde VBA,
+o manual): el primer argumento puede ser un archivo .json (modo
+extraer+combinar) o una carpeta con CSV ya existentes (modo solo
+combinar) -- se detecta automaticamente segun cual sea:
     ABSPIEXCELEXTRACT.exe parametros_extraccion_XXXX.json [carpeta_salida]
+    ABSPIEXCELEXTRACT.exe "C:\\ruta\\carpeta_con_csvs" [carpeta_salida]
 """
 import sys
 import os
@@ -500,15 +503,24 @@ def main():
 
     if len(sys.argv) >= 2:
         # Modo linea de comandos (lanzado desde VBA, o manual con argumentos).
-        # Se sigue aceptando SOLO un archivo .json, como antes.
+        # El primer argumento puede ser:
+        #   - un archivo .json de parametros -> modo "extraer" (PI + combina)
+        #   - una carpeta con CSV ya existentes -> modo "combinar" (sin PI)
+        # Se detecta automaticamente segun que es (archivo vs carpeta).
         ruta_entrada = sys.argv[1]
-        if not os.path.isfile(ruta_entrada):
+
+        if os.path.isdir(ruta_entrada):
+            modo = "combinar"
+            carpeta_salida = sys.argv[2] if len(sys.argv) > 2 else ruta_entrada
+        elif os.path.isfile(ruta_entrada):
+            modo = "extraer"
+            carpeta_salida = sys.argv[2] if len(sys.argv) > 2 else os.path.dirname(os.path.abspath(ruta_entrada))
+        else:
             root = tk.Tk()
             root.withdraw()
-            messagebox.showerror("ABSPIEXCELEXTRACT", f"No se encontro el archivo:\n{ruta_entrada}")
+            messagebox.showerror("ABSPIEXCELEXTRACT",
+                                  f"No se encontro el archivo ni la carpeta:\n{ruta_entrada}")
             sys.exit(1)
-        modo = "extraer"
-        carpeta_salida = sys.argv[2] if len(sys.argv) > 2 else os.path.dirname(os.path.abspath(ruta_entrada))
     else:
         # Doble clic sin argumentos: preguntar que quiere hacer
         modo, ruta_entrada, carpeta_salida = elegir_entrada_con_dialogo()
