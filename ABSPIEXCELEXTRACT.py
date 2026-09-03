@@ -29,7 +29,17 @@ de parametros, sin ver ni poder modificar la logica interna.
 
 Requisitos para COMPILAR (no para el usuario final):
     pip install pywin32 pandas pyinstaller
-    pyinstaller --onefile --noconsole --name ABSPIEXCELEXTRACT ABSPIEXCELEXTRACT.py
+    pyinstaller --onefile --noconsole --name ABSPIEXCELEXTRACT ^
+        --hidden-import=win32timezone ^
+        --hidden-import=win32com.gen_py ^
+        --collect-submodules win32com ^
+        ABSPIEXCELEXTRACT.py
+
+Los flags --hidden-import y --collect-submodules son NECESARIOS: sin
+ellos, PyInstaller a veces no empaqueta la maquinaria interna de
+pywin32 que genera/importa wrappers COM en tiempo de ejecucion
+(gencache.EnsureDispatch), causando el error "No module named
+win32com.gen_py.<CLSID>..." incluso con la cache de tipos vacia.
 
 Este .exe debe quedar instalado en: C:\\ABSTOOLS\\ABSPIEXCELEXTRACT.exe
 (esa es la ruta que espera el modulo VBA "GenerarParametrosExtraccion"
@@ -74,7 +84,11 @@ def _preparar_cache_com():
     cache de tipos que necesita gencache.EnsureDispatch puede intentar
     escribirse dentro del paquete empaquetado (de solo lectura) y fallar
     en silencio o de forma rara. Forzamos que use una carpeta temporal
-    del usuario, que siempre es escribible."""
+    del usuario, que siempre es escribible, y la registramos en sys.path
+    de forma explicita -- en un exe congelado (PyInstaller), el mecanismo
+    de import personalizado a veces no encuentra por su cuenta modulos
+    escritos dinamicamente en disco fuera del paquete, aunque
+    win32com.__gen_path__ ya apunte ahi."""
     if win32com is None:
         return None
     if getattr(sys, "frozen", False):
@@ -82,6 +96,8 @@ def _preparar_cache_com():
         cache_dir = os.path.join(tempfile.gettempdir(), "abspiexcelextract_gen_py")
         os.makedirs(cache_dir, exist_ok=True)
         win32com.__gen_path__ = cache_dir
+        if cache_dir not in sys.path:
+            sys.path.insert(0, cache_dir)
         return cache_dir
     return None
 
@@ -303,11 +319,22 @@ def extraer_series(params, ui, carpeta_salida):
                 ui.log("Cache de COM desactualizada, regenerando automaticamente...")
                 _limpiar_cache_com(_cache_com_dir)
                 continue
-            ui.log(f"ERROR: no se pudo crear el objeto PISDK.PISDK. "
+            ui.log(f"ERROR con EnsureDispatch (enlace temprano): {e}")
+            break
+
+    if pisdk is None:
+        # Ultimo recurso: enlace tardio comun. No es ideal (el motivo por
+        # el que se uso gencache fue evitar "The Python instance can not
+        # be converted to a COM object" al pasar ts_start/ts_end como
+        # argumentos), pero es mejor intentarlo que fallar por completo
+        # si el mecanismo de gencache no funciona en este build del .exe.
+        ui.log("Reintentando con enlace tardio (Dispatch normal) como ultimo recurso...")
+        try:
+            pisdk = win32com.client.Dispatch("PISDK.PISDK")
+        except Exception as e:
+            ui.log(f"ERROR: no se pudo crear el objeto PISDK.PISDK de ninguna forma. "
                    f"Verifica que PI-SDK este instalado en esta maquina.\n{e}")
             return []
-    if pisdk is None:
-        return []
 
     try:
         server = pisdk.Servers(servidor_nombre)
@@ -327,10 +354,17 @@ def extraer_series(params, ui, carpeta_salida):
                 ui.log("Cache de COM desactualizada (PITime), regenerando automaticamente...")
                 _limpiar_cache_com(_cache_com_dir)
                 continue
-            ui.log(f"ERROR: no se pudo crear el objeto PITimeServer.PITime.\n{e}")
-            return []
+            ui.log(f"ERROR con EnsureDispatch para PITime: {e}")
+            break
+
     if ts_start is None or ts_end is None:
-        return []
+        ui.log("Reintentando PITime con enlace tardio (Dispatch normal) como ultimo recurso...")
+        try:
+            ts_start = win32com.client.Dispatch("PITimeServer.PITime")
+            ts_end = win32com.client.Dispatch("PITimeServer.PITime")
+        except Exception as e:
+            ui.log(f"ERROR: no se pudo crear el objeto PITimeServer.PITime de ninguna forma.\n{e}")
+            return []
 
     ts_start.UTCSeconds = utc_start
     ts_end.UTCSeconds = utc_end
