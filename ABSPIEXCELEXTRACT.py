@@ -66,6 +66,7 @@ except ImportError:
 
 import tkinter as tk
 from tkinter import messagebox
+from tkinter import ttk
 
 
 def _preparar_cache_com():
@@ -75,24 +76,47 @@ def _preparar_cache_com():
     en silencio o de forma rara. Forzamos que use una carpeta temporal
     del usuario, que siempre es escribible."""
     if win32com is None:
-        return
+        return None
     if getattr(sys, "frozen", False):
         import tempfile
         cache_dir = os.path.join(tempfile.gettempdir(), "abspiexcelextract_gen_py")
         os.makedirs(cache_dir, exist_ok=True)
         win32com.__gen_path__ = cache_dir
+        return cache_dir
+    return None
+
+
+_cache_com_dir = None  # se completa en main() -> _preparar_cache_com()
+
+
+def _limpiar_cache_com(cache_dir):
+    """Borra la carpeta de cache de tipos COM (gen_py). Se usa cuando
+    EnsureDispatch falla con 'No module named win32com.gen_py....' --
+    esto pasa si la cache quedo corrupta o desincronizada (ej. el .exe
+    se actualizo/recompilo y la cache vieja en %TEMP% ya no coincide).
+    Borrarla fuerza que se regenere limpia en el siguiente intento."""
+    if not cache_dir or not os.path.isdir(cache_dir):
+        return
+    import shutil
+    try:
+        shutil.rmtree(cache_dir, ignore_errors=True)
+    except Exception:
+        pass
 
 
 class VentanaProgreso:
-    """Ventanita de progreso simple: un titulo, una barra de estado
-    y una caja de texto tipo log. No usa mainloop() de forma
-    bloqueante -- se actualiza manualmente con update() desde el
-    hilo de trabajo, igual que en el combinador original."""
+    """Ventanita de progreso: titulo, barra de estado (texto), barra
+    de progreso visual (determinate mientras se conoce el total --
+    tag por tag, archivo por archivo -- e indeterminate/animada
+    durante la combinacion, que es una operacion vectorizada sin
+    pasos individuales que mostrar), y una caja de texto tipo log.
+    No usa mainloop() de forma bloqueante -- se actualiza manualmente
+    con update() desde el hilo de trabajo."""
 
     def __init__(self):
         self.root = tk.Tk()
         self.root.title("ABSPIEXCELEXTRACT")
-        self.root.geometry("640x420")
+        self.root.geometry("640x460")
         self.root.resizable(True, True)
 
         titulo = tk.Label(self.root, text="ABSPIEXCELEXTRACT",
@@ -102,10 +126,23 @@ class VentanaProgreso:
         self.estado_var = tk.StringVar(value="Iniciando...")
         estado_lbl = tk.Label(self.root, textvariable=self.estado_var,
                                font=("Segoe UI", 10))
-        estado_lbl.pack(pady=(4, 8))
+        estado_lbl.pack(pady=(4, 6))
+
+        # --- Barra de progreso visual ---
+        barra_frame = tk.Frame(self.root)
+        barra_frame.pack(fill="x", padx=12, pady=(0, 4))
+
+        self.progress = ttk.Progressbar(barra_frame, orient="horizontal",
+                                         mode="determinate", maximum=100)
+        self.progress.pack(fill="x", side="left", expand=True)
+
+        self.progress_pct_var = tk.StringVar(value="")
+        progress_pct_lbl = tk.Label(barra_frame, textvariable=self.progress_pct_var,
+                                     font=("Segoe UI", 9), width=6)
+        progress_pct_lbl.pack(side="left", padx=(8, 0))
 
         frame_log = tk.Frame(self.root)
-        frame_log.pack(fill="both", expand=True, padx=12, pady=(0, 12))
+        frame_log.pack(fill="both", expand=True, padx=12, pady=(8, 12))
 
         scrollbar = tk.Scrollbar(frame_log)
         scrollbar.pack(side="right", fill="y")
@@ -137,7 +174,39 @@ class VentanaProgreso:
         self.root.update_idletasks()
         self.root.update()
 
+    def progreso(self, valor, maximo):
+        """Barra determinate: usar cuando se conoce el total de pasos
+        (ej. extrayendo tag i de N, o leyendo archivo i de N)."""
+        if maximo <= 0:
+            maximo = 1
+        if self.progress["mode"] != "determinate":
+            self.progress.stop()
+            self.progress.config(mode="determinate")
+        self.progress.config(maximum=maximo)
+        self.progress["value"] = valor
+        pct = int(round(100 * valor / maximo))
+        self.progress_pct_var.set(f"{pct}%")
+        self.root.update_idletasks()
+        self.root.update()
+
+    def progreso_indeterminado(self, activar=True):
+        """Barra animada (va y viene): usar durante pasos sin un total
+        conocido de antemano, como el pivot_table de pandas (es
+        vectorizado y casi instantaneo, no tiene 'items' que contar)."""
+        if activar:
+            self.progress.config(mode="indeterminate")
+            self.progress_pct_var.set("...")
+            self.progress.start(12)
+        else:
+            self.progress.stop()
+            self.progress.config(mode="determinate")
+        self.root.update_idletasks()
+        self.root.update()
+
     def terminar(self, exito=True):
+        self.progreso_indeterminado(False)
+        self.progress["value"] = self.progress["maximum"] if exito else 0
+        self.progress_pct_var.set("100%" if exito else "")
         self.estado("Completado" if exito else "Termino con errores")
         self.boton_cerrar.config(state="normal")
 
@@ -189,11 +258,27 @@ def extraer_series(params, ui, carpeta_salida):
     # genera un wrapper con la definicion real del tipo (equivalente a usar
     # "Dim x As PISDK.PISDK" en VBA en vez de "CreateObject"), lo que
     # resuelve el problema de raiz.
-    try:
-        pisdk = win32com.client.gencache.EnsureDispatch("PISDK.PISDK")
-    except Exception as e:
-        ui.log(f"ERROR: no se pudo crear el objeto PISDK.PISDK. "
-               f"Verifica que PI-SDK este instalado en esta maquina.\n{e}")
+    #
+    # Si la cache de tipos (gen_py) quedo corrupta/desincronizada (ej. tras
+    # actualizar el .exe), EnsureDispatch falla con "No module named
+    # win32com.gen_py.<CLSID>...". En ese caso se borra la cache y se
+    # reintenta UNA vez, regenerandola desde cero automaticamente, sin que
+    # el usuario tenga que borrar nada a mano en %TEMP%.
+    pisdk = None
+    for intento in range(2):
+        try:
+            pisdk = win32com.client.gencache.EnsureDispatch("PISDK.PISDK")
+            break
+        except Exception as e:
+            es_error_cache = "gen_py" in str(e) or "No module named" in str(e)
+            if intento == 0 and es_error_cache:
+                ui.log("Cache de COM desactualizada, regenerando automaticamente...")
+                _limpiar_cache_com(_cache_com_dir)
+                continue
+            ui.log(f"ERROR: no se pudo crear el objeto PISDK.PISDK. "
+                   f"Verifica que PI-SDK este instalado en esta maquina.\n{e}")
+            return []
+    if pisdk is None:
         return []
 
     try:
@@ -202,13 +287,29 @@ def extraer_series(params, ui, carpeta_salida):
         ui.log(f"ERROR: no se pudo conectar al servidor '{servidor_nombre}'.\n{e}")
         return []
 
-    ts_start = win32com.client.gencache.EnsureDispatch("PITimeServer.PITime")
-    ts_end = win32com.client.gencache.EnsureDispatch("PITimeServer.PITime")
+    ts_start = ts_end = None
+    for intento in range(2):
+        try:
+            ts_start = win32com.client.gencache.EnsureDispatch("PITimeServer.PITime")
+            ts_end = win32com.client.gencache.EnsureDispatch("PITimeServer.PITime")
+            break
+        except Exception as e:
+            es_error_cache = "gen_py" in str(e) or "No module named" in str(e)
+            if intento == 0 and es_error_cache:
+                ui.log("Cache de COM desactualizada (PITime), regenerando automaticamente...")
+                _limpiar_cache_com(_cache_com_dir)
+                continue
+            ui.log(f"ERROR: no se pudo crear el objeto PITimeServer.PITime.\n{e}")
+            return []
+    if ts_start is None or ts_end is None:
+        return []
+
     ts_start.UTCSeconds = utc_start
     ts_end.UTCSeconds = utc_end
 
     series = []
     ui.log("\n=== Extrayendo trazas ===")
+    ui.progreso(0, len(tags))
     for i, tag_raw in enumerate(tags, start=1):
         tag = limpiar_nombre_tag(tag_raw)
         ui.estado(f"Extrayendo {i}/{len(tags)}: {tag}")
@@ -220,6 +321,7 @@ def extraer_series(params, ui, carpeta_salida):
             ui.log(f"[{i}/{len(tags)}] {tag}: TAG NO ENCONTRADO -- se omite")
             _escribir_csv_individual(carpeta_salida, i, nombre_archivo_seguro, 0,
                                       filas_error=[("", "", f"TAG NO ENCONTRADO: {tag}")])
+            ui.progreso(i, len(tags))
             continue
 
         try:
@@ -228,6 +330,7 @@ def extraer_series(params, ui, carpeta_salida):
             ui.log(f"[{i}/{len(tags)}] {tag}: ERROR ({e}) -- se omite")
             _escribir_csv_individual(carpeta_salida, i, nombre_archivo_seguro, 0,
                                       filas_error=[("", "", f"ERROR: {e}")])
+            ui.progreso(i, len(tags))
             continue
 
         puntos = []
@@ -253,6 +356,8 @@ def extraer_series(params, ui, carpeta_salida):
 
         if puntos:
             series.append((tag, puntos))
+
+        ui.progreso(i, len(tags))
 
     return series
 
@@ -342,6 +447,7 @@ def combinar_desde_carpeta(carpeta, ui):
     ui.log(f"Encontrados {len(archivos)} archivos CSV en la carpeta.\n")
 
     series = []
+    ui.progreso(0, len(archivos))
     for i, nombre in enumerate(sorted(archivos), start=1):
         ruta = os.path.join(carpeta, nombre)
         ui.estado(f"Leyendo {i}/{len(archivos)}: {nombre}")
@@ -349,6 +455,7 @@ def combinar_desde_carpeta(carpeta, ui):
         ui.log(f"[{i}/{len(archivos)}] {nombre} -> tag='{tag}', {len(puntos)} puntos")
         if puntos:
             series.append((tag, puntos))
+        ui.progreso(i, len(archivos))
 
     return series
 
@@ -364,10 +471,22 @@ def combinar_series(series, ui):
         ui.log("No hay series validas para combinar.")
         return None
 
+    # --- Armar la tabla larga: progreso determinate (se conoce el total de puntos) ---
+    total_puntos = sum(len(puntos) for _, puntos in series)
     filas_largo = []
+    procesados = 0
+    ui.estado("Combinando series: preparando datos...")
+    ui.progreso(0, total_puntos)
     for tag, puntos in series:
         for ts, val in puntos:
             filas_largo.append({"Timestamp": ts, "Valor": val, "Tag": tag})
+            procesados += 1
+        ui.progreso(procesados, total_puntos)
+
+    # --- Pivot/alineacion: operacion vectorizada de pandas, sin pasos
+    # individuales que mostrar -> barra animada (indeterminate) ---
+    ui.estado("Combinando series: alineando por tiempo...")
+    ui.progreso_indeterminado(True)
 
     df = pd.DataFrame(filas_largo)
     df = df.dropna(subset=["Valor"])
@@ -380,6 +499,8 @@ def combinar_series(series, ui):
 
     resultado = pivot.reset_index()
     resultado.columns.name = None
+
+    ui.progreso_indeterminado(False)
 
     ui.log(f"Filas combinadas: {len(resultado)}")
     ui.log(f"Columnas (tags): {len(resultado.columns) - 1}")
@@ -499,7 +620,8 @@ def elegir_entrada_con_dialogo():
 
 
 def main():
-    _preparar_cache_com()
+    global _cache_com_dir
+    _cache_com_dir = _preparar_cache_com()
 
     if len(sys.argv) >= 2:
         # Modo linea de comandos (lanzado desde VBA, o manual con argumentos).
