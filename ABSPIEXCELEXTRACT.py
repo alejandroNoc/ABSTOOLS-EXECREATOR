@@ -25,7 +25,14 @@ Este programa:
   2. Combina todas las series en una sola tabla, con el enfoque
      "forward-fill + backfill" (pivot por Tag, sin inventar fechas,
      manteniendo el ultimo valor real conocido como hace PI Trend).
-  3. Escribe un unico CSV combinado, listo para usar, y lo abre solo.
+  3. Pregunta como se quiere el CSV combinado (dialogo con 3 botones):
+       - Fragmentado: lo parte en varios CSV, cada uno con como maximo
+         1,000,000 de filas, para poder abrirlos directo en Excel
+         (que tiene un limite de ~1,048,576 filas por hoja).
+       - Completo: un solo archivo, sin fragmentar, sin importar el
+         limite de filas de Excel.
+       - Ambos: escribe las dos versiones.
+  4. Escribe el/los archivo(s) elegido(s) y abre uno al terminar.
 
 Si se abre con DOBLE CLIC (sin argumentos), pregunta la carpeta con
 los CSV a combinar.
@@ -47,6 +54,7 @@ Uso por linea de comandos (lanzado desde VBA, o manual):
 import sys
 import os
 import csv
+import math
 import threading
 from datetime import datetime
 
@@ -58,6 +66,12 @@ except ImportError:
 import tkinter as tk
 from tkinter import messagebox
 from tkinter import ttk
+
+
+# Limite de filas por archivo cuando se elige "fragmentado". Se usa un
+# margen bajo el limite real de Excel (1,048,576 filas por hoja) para
+# dejar espacio al encabezado y no quedar justo en el borde.
+LIMITE_FILAS_EXCEL = 1000000
 
 
 class VentanaProgreso:
@@ -157,6 +171,52 @@ class VentanaProgreso:
         self.progress_pct_var.set("100%" if exito else "")
         self.estado("Completado" if exito else "Termino con errores")
         self.boton_cerrar.config(state="normal")
+
+    def preguntar_formato_salida(self):
+        """Pregunta como quiere el usuario el CSV combinado:
+        'fragmentado' (varios archivos, cada uno dentro del limite de
+        filas de Excel, para abrirlos ahi directo), 'completo' (un solo
+        archivo sin fragmentar), o 'ambos'. Dialogo modal con 3 botones.
+        Devuelve None si se cierra sin elegir (cancelado)."""
+        resultado = {"valor": None}
+
+        top = tk.Toplevel(self.root)
+        top.title("Formato de salida")
+        top.transient(self.root)
+        top.grab_set()
+        top.resizable(False, False)
+
+        tk.Label(top, text="Como queres el CSV combinado?",
+                 font=("Segoe UI", 11, "bold")).pack(padx=20, pady=(16, 4))
+        tk.Label(top,
+                 text="Excel tiene un limite de ~1,048,576 filas por hoja.\n"
+                      "Si el combinado supera eso, 'Fragmentado' lo parte\n"
+                      "en varios CSV que si puedes abrir directo en Excel.",
+                 font=("Segoe UI", 9), justify="left").pack(padx=20, pady=(0, 12))
+
+        def elegir(valor):
+            resultado["valor"] = valor
+            top.destroy()
+
+        frame_botones = tk.Frame(top)
+        frame_botones.pack(pady=(0, 16), padx=20)
+
+        tk.Button(frame_botones, text="Fragmentado\n(para Excel)", width=16,
+                  command=lambda: elegir("fragmentado")).pack(side="left", padx=4)
+        tk.Button(frame_botones, text="Completo\n(un solo archivo)", width=16,
+                  command=lambda: elegir("completo")).pack(side="left", padx=4)
+        tk.Button(frame_botones, text="Ambos", width=16,
+                  command=lambda: elegir("ambos")).pack(side="left", padx=4)
+
+        top.protocol("WM_DELETE_WINDOW", lambda: elegir(None))
+
+        top.update_idletasks()
+        x = self.root.winfo_x() + (self.root.winfo_width() - top.winfo_width()) // 2
+        y = self.root.winfo_y() + (self.root.winfo_height() - top.winfo_height()) // 2
+        top.geometry(f"+{x}+{y}")
+
+        self.root.wait_window(top)
+        return resultado["valor"]
 
     def iniciar_loop(self):
         self.root.mainloop()
@@ -284,6 +344,28 @@ def combinar_series(series, ui):
     return resultado
 
 
+def escribir_csv_fragmentado(df, carpeta_salida, nombre_base, ui):
+    """Parte el DataFrame combinado en varios CSV, cada uno con como
+    maximo LIMITE_FILAS_EXCEL filas, para que se puedan abrir directo
+    en Excel sin toparse con el limite de filas por hoja. Devuelve la
+    lista de rutas escritas."""
+    total_filas = len(df)
+    n_partes = max(1, math.ceil(total_filas / LIMITE_FILAS_EXCEL))
+    rutas = []
+
+    for parte in range(n_partes):
+        inicio = parte * LIMITE_FILAS_EXCEL
+        fin = min(inicio + LIMITE_FILAS_EXCEL, total_filas)
+        trozo = df.iloc[inicio:fin]
+        nombre = f"{nombre_base}_parte{parte + 1}de{n_partes}.csv"
+        ruta = os.path.join(carpeta_salida, nombre)
+        trozo.to_csv(ruta, index=False, encoding="utf-8")
+        ui.log(f"  Parte {parte + 1}/{n_partes}: {len(trozo)} filas -> {nombre}")
+        rutas.append(ruta)
+
+    return rutas
+
+
 def trabajo_principal(ui, carpeta_entrada, carpeta_salida):
     """Corre en un hilo aparte para no congelar la ventana. No toca
     COM/PI para nada -- solo lee CSVs de disco y combina con pandas."""
@@ -301,18 +383,36 @@ def trabajo_principal(ui, carpeta_entrada, carpeta_salida):
             ui.terminar(exito=False)
             return
 
-        nombre_salida = f"Combinado_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
-        ruta_salida = os.path.join(carpeta_salida, nombre_salida)
-        resultado.to_csv(ruta_salida, index=False, encoding="utf-8")
+        nombre_base = f"Combinado_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+
+        formato = ui.preguntar_formato_salida()
+        if formato is None:
+            ui.log("Operacion cancelada (no se eligio formato de salida).")
+            ui.terminar(exito=False)
+            return
+
+        archivo_a_abrir = None
+
+        if formato in ("completo", "ambos"):
+            ruta_completo = os.path.join(carpeta_salida, f"{nombre_base}.csv")
+            resultado.to_csv(ruta_completo, index=False, encoding="utf-8")
+            ui.log(f"\nArchivo completo: {ruta_completo} ({len(resultado)} filas)")
+            archivo_a_abrir = ruta_completo
+
+        if formato in ("fragmentado", "ambos"):
+            ui.log(f"\nGenerando archivos fragmentados (limite {LIMITE_FILAS_EXCEL} filas c/u)...")
+            rutas_frag = escribir_csv_fragmentado(resultado, carpeta_salida, nombre_base, ui)
+            if archivo_a_abrir is None and rutas_frag:
+                archivo_a_abrir = rutas_frag[0]
 
         ui.log(f"\n=== LISTO ===")
-        ui.log(f"Archivo combinado: {ruta_salida}")
         ui.terminar(exito=True)
 
-        try:
-            os.startfile(ruta_salida)
-        except Exception:
-            pass
+        if archivo_a_abrir:
+            try:
+                os.startfile(archivo_a_abrir)
+            except Exception:
+                pass
 
     except Exception as e:
         ui.log(f"\nERROR INESPERADO: {e}")
