@@ -5,10 +5,13 @@ A partir de un archivo de parametros JSON generado por la macro VBA
 "GenerarParametrosExtraccion", hace en un solo paso:
   1. Se conecta a PI-SDK y extrae cada tag con timestamps reales
      (RecordedValues, igual que hacia la macro VBA).
-  2. Combina todas las series en una sola tabla, usando el mismo
+  2. Escribe un CSV individual por tag (formato TAGn_nombre_conteo.csv),
+     con las columnas Timestamp,Valor,Tag -- util para inspeccionar o
+     auditar cada traza por separado.
+  3. Combina todas las series en una sola tabla, usando el mismo
      enfoque "forward-fill + backfill" que se valido en el flujo
      de Excel/Python (pivot por Tag, sin inventar fechas).
-  3. Escribe un unico CSV combinado, listo para usar.
+  4. Escribe un unico CSV combinado, listo para usar.
 
 Muestra una ventanita de progreso (Tkinter) con el avance en vivo,
 para poder compilarse con --noconsole y aun asi ver que esta pasando.
@@ -140,10 +143,21 @@ def limpiar_nombre_tag(tag):
     return tag
 
 
-def extraer_series(params, ui):
-    """Se conecta a PI y extrae cada tag. Devuelve una lista de
-    (tag, [(datetime, valor), ...]) -- solo en memoria, sin CSV
-    intermedios por tag."""
+def limpiar_nombre_para_archivo(nombre_tag):
+    """Reemplaza caracteres no permitidos en nombres de archivo de Windows
+    (los tags de PI suelen traer ':' -- ej. 'TANK:15J03YB52COD.LV' --
+    que NO es valido en un nombre de archivo)."""
+    invalidos = [":", "\\", "/", "*", "?", '"', "<", ">", "|"]
+    r = nombre_tag
+    for ch in invalidos:
+        r = r.replace(ch, "_")
+    return r
+
+
+def extraer_series(params, ui, carpeta_salida):
+    """Se conecta a PI y extrae cada tag. Ademas de devolver todo en
+    memoria para el combinado, escribe un CSV individual por tag
+    (formato TAGn_nombre_conteo.csv), igual que hacia la macro VBA."""
     servidor_nombre = params["server"]
     tags = params["tags"]
     utc_start = params["start_utc_seconds"]
@@ -185,17 +199,22 @@ def extraer_series(params, ui):
     for i, tag_raw in enumerate(tags, start=1):
         tag = limpiar_nombre_tag(tag_raw)
         ui.estado(f"Extrayendo {i}/{len(tags)}: {tag}")
+        nombre_archivo_seguro = limpiar_nombre_para_archivo(tag)
 
         try:
             point = server.PIPoints(tag)
         except Exception:
             ui.log(f"[{i}/{len(tags)}] {tag}: TAG NO ENCONTRADO -- se omite")
+            _escribir_csv_individual(carpeta_salida, i, nombre_archivo_seguro, 0,
+                                      filas_error=[("", "", f"TAG NO ENCONTRADO: {tag}")])
             continue
 
         try:
             values = point.Data.RecordedValues(ts_start, ts_end)
         except Exception as e:
             ui.log(f"[{i}/{len(tags)}] {tag}: ERROR ({e}) -- se omite")
+            _escribir_csv_individual(carpeta_salida, i, nombre_archivo_seguro, 0,
+                                      filas_error=[("", "", f"ERROR: {e}")])
             continue
 
         puntos = []
@@ -214,10 +233,34 @@ def extraer_series(params, ui):
             puntos.append((ts_local, val))
 
         ui.log(f"[{i}/{len(tags)}] {tag}: {len(puntos)} puntos")
+
+        # CSV individual de esta traza, con el conteo real ya en el nombre
+        _escribir_csv_individual(carpeta_salida, i, nombre_archivo_seguro, len(puntos),
+                                  puntos=puntos, tag_completo=tag)
+
         if puntos:
             series.append((tag, puntos))
 
     return series
+
+
+def _escribir_csv_individual(carpeta_salida, indice, nombre_archivo_seguro, conteo,
+                              puntos=None, tag_completo="", filas_error=None):
+    """Escribe el CSV individual de una traza: TAGn_nombre_conteo.csv
+    Mismo formato/contenido que generaba la macro VBA (columnas
+    Timestamp,Valor,Tag), asi los archivos siguen siendo compatibles
+    con cualquier otra herramienta que ya espere ese formato."""
+    nombre = f"TAG{indice}_{nombre_archivo_seguro}_{conteo}.csv"
+    ruta = os.path.join(carpeta_salida, nombre)
+    with open(ruta, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(["Timestamp", "Valor", "Tag"])
+        if filas_error:
+            for fila in filas_error:
+                writer.writerow(fila)
+        elif puntos:
+            for ts, val in puntos:
+                writer.writerow([ts.strftime("%Y-%m-%d %H:%M:%S"), val, tag_completo])
 
 
 def combinar_series(series, ui):
@@ -277,11 +320,12 @@ def trabajo_principal(ui, ruta_json, carpeta_salida):
         com_inicializado = True
 
         params = cargar_parametros(ruta_json)
-        series = extraer_series(params, ui)
+        series = extraer_series(params, ui, carpeta_salida)
         resultado = combinar_series(series, ui)
 
         if resultado is None:
-            ui.log("No se genero ningun archivo (sin datos validos).")
+            ui.log("No se genero ningun archivo combinado (sin datos validos).")
+            ui.log(f"Revisa los CSV individuales por tag en: {carpeta_salida}")
             ui.terminar(exito=False)
             return
 
@@ -290,6 +334,7 @@ def trabajo_principal(ui, ruta_json, carpeta_salida):
         resultado.to_csv(ruta_salida, index=False, encoding="utf-8")
 
         ui.log(f"\n=== LISTO ===")
+        ui.log(f"CSV individuales por tag: {carpeta_salida}")
         ui.log(f"Archivo combinado: {ruta_salida}")
         ui.terminar(exito=True)
 
