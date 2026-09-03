@@ -18,7 +18,11 @@ jobs:
             exit 1
           }
           Write-Host "Compilando: $($archivo.Name)"
-          pyinstaller --onefile --noconsole $archivo.FullName
+          pyinstaller --onefile --noconsole `
+            --hidden-import=win32timezone `
+            --hidden-import=win32com.gen_py `
+            --collect-submodules win32com `
+            $archivo.FullName
           echo "NOMBRE_EXE=$($archivo.BaseName)" >> $env:GITHUB_ENV
       - uses: actions/upload-artifact@v4
         with:
