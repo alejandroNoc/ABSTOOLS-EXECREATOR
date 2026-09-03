@@ -3,14 +3,25 @@ ABSPIEXCELEXTRACT - Extractor + Combinador de datos PI
 
 A partir de un archivo de parametros JSON generado por la macro VBA
 "GenerarParametrosExtraccion", hace en un solo paso:
-  1. Se conecta a PI-SDK y extrae cada tag con timestamps reales
-     (RecordedValues, igual que hacia la macro VBA).
-  2. Escribe un CSV individual por tag (formato TAGn_nombre_conteo.csv),
-     con las columnas Timestamp,Valor,Tag -- util para inspeccionar o
-     auditar cada traza por separado.
-  3. Combina todas las series en una sola tabla, usando el mismo
-     enfoque "forward-fill + backfill" que se valido en el flujo
-     de Excel/Python (pivot por Tag, sin inventar fechas).
+  1. Lanza un script PowerShell (generado internamente, embebido en
+     este mismo archivo) que se conecta a PI-SDK via COM NATIVO de
+     Windows y extrae cada tag con timestamps reales -- exactamente
+     el mismo mecanismo que usaba la macro VBA (New-Object -ComObject,
+     igual que "CreateObject"/"New" en VBA). Se uso PowerShell para la
+     extraccion en vez de Python/pywin32 porque, tras varias pruebas,
+     pywin32 (tanto con gencache/enlace temprano como con Dispatch/
+     enlace tardio) no logra pasar objetos PITime como argumento de
+     RecordedValues() de forma confiable dentro de un .exe compilado
+     con PyInstaller -- falla con "The Python instance can not be
+     converted to a COM object" o con errores de cache de tipos
+     ("No module named win32com.gen_py..."). PowerShell usa COM nativo
+     de Windows (igual que VBA), sin esa capa fragil.
+  2. El script de PowerShell escribe un CSV individual por tag
+     (formato TAGn_nombre_conteo.csv, columnas Timestamp,Valor,Tag).
+  3. Python lee esos CSV y combina todo en una sola tabla, con el
+     mismo enfoque "forward-fill + backfill" ya validado (pivot por
+     Tag, sin inventar fechas) -- esta parte SI funciona perfecto en
+     Python/pandas, no tiene relacion con COM.
   4. Escribe un unico CSV combinado, listo para usar.
 
 Si se abre con DOBLE CLIC (sin argumentos de linea de comandos),
@@ -23,23 +34,19 @@ pregunta si se quiere:
 Muestra una ventanita de progreso (Tkinter) con el avance en vivo,
 para poder compilarse con --noconsole y aun asi ver que esta pasando.
 
-Pensado para compilarse como ABSPIEXCELEXTRACT.exe con PyInstaller,
-de forma que el usuario final solo reciba el ejecutable y el JSON
-de parametros, sin ver ni poder modificar la logica interna.
+Requisitos en la maquina que EJECUTA el .exe:
+  - PI-SDK instalado (provee los objetos COM "PISDK.PISDK" y
+    "PITimeServer.PITime" que usa el script de PowerShell).
+  - PowerShell 5.1+ (viene por defecto en Windows 10/11 y Server
+    2016+, asi que en la practica no requiere instalar nada extra).
+  - pandas (para la combinacion; se compila dentro del .exe).
 
 Requisitos para COMPILAR (no para el usuario final):
-    pip install pywin32 pandas pyinstaller
-    pyinstaller --onefile --noconsole --name ABSPIEXCELEXTRACT ^
-        --hidden-import=win32timezone ^
-        --hidden-import=win32com.gen_py ^
-        --collect-submodules win32com ^
-        ABSPIEXCELEXTRACT.py
+    pip install pandas pyinstaller
+    pyinstaller --onefile --noconsole --name ABSPIEXCELEXTRACT ABSPIEXCELEXTRACT.py
 
-Los flags --hidden-import y --collect-submodules son NECESARIOS: sin
-ellos, PyInstaller a veces no empaqueta la maquinaria interna de
-pywin32 que genera/importa wrappers COM en tiempo de ejecucion
-(gencache.EnsureDispatch), causando el error "No module named
-win32com.gen_py.<CLSID>..." incluso con la cache de tipos vacia.
+Ya NO se requiere pywin32 para compilar (la extraccion via PI-SDK
+ahora la hace PowerShell, no Python).
 
 Este .exe debe quedar instalado en: C:\\ABSTOOLS\\ABSPIEXCELEXTRACT.exe
 (esa es la ruta que espera el modulo VBA "GenerarParametrosExtraccion"
@@ -59,15 +66,10 @@ import os
 import json
 import csv
 import threading
+import subprocess
+import tempfile
+import re
 from datetime import datetime
-
-try:
-    import win32com.client
-    import win32com.client.gencache
-    import pythoncom
-except ImportError:
-    win32com = None
-    pythoncom = None
 
 try:
     import pandas as pd
@@ -79,73 +81,132 @@ from tkinter import messagebox
 from tkinter import ttk
 
 
-def _preparar_cache_com():
-    """Cuando este script corre como .exe compilado (PyInstaller), la
-    cache de tipos que necesita gencache.EnsureDispatch puede intentar
-    escribirse dentro del paquete empaquetado (de solo lectura) y fallar
-    en silencio o de forma rara. Forzamos que use una carpeta temporal
-    del usuario, que siempre es escribible, y la registramos en sys.path
-    de forma explicita -- en un exe congelado (PyInstaller), el mecanismo
-    de import personalizado a veces no encuentra por su cuenta modulos
-    escritos dinamicamente en disco fuera del paquete, aunque
-    win32com.__gen_path__ ya apunte ahi."""
-    if win32com is None:
-        return None
-    if getattr(sys, "frozen", False):
-        import tempfile
-        cache_dir = os.path.join(tempfile.gettempdir(), "abspiexcelextract_gen_py")
-        os.makedirs(cache_dir, exist_ok=True)
-        win32com.__gen_path__ = cache_dir
-        if cache_dir not in sys.path:
-            sys.path.insert(0, cache_dir)
-        return cache_dir
-    return None
+# ============================================================
+# Script de PowerShell embebido: hace la extraccion de PI usando
+# COM nativo de Windows (New-Object -ComObject), igual que VBA.
+# Se escribe a un archivo temporal en tiempo de ejecucion y se
+# invoca con subprocess -- asi no depende de --add-data de
+# PyInstaller ni de rutas relativas al .exe.
+# ============================================================
+_POWERSHELL_SCRIPT = r'''
+param(
+    [Parameter(Mandatory=$true)][string]$ParamsJson,
+    [Parameter(Mandatory=$true)][string]$OutFolder
+)
 
+$ErrorActionPreference = "Stop"
 
-_cache_com_dir = None  # se completa en main() -> _preparar_cache_com()
+function Limpiar-NombreTag($tag) {
+    if ($tag -match '\\') {
+        $partes = $tag -split '\\'
+        return $partes[$partes.Count - 1]
+    }
+    return $tag
+}
 
+function Limpiar-NombreArchivo($nombre) {
+    $invalidos = @(':','\','/','*','?','"','<','>','|')
+    $r = $nombre
+    foreach ($ch in $invalidos) { $r = $r.Replace($ch, '_') }
+    return $r
+}
 
-def _limpiar_cache_com(cache_dir):
-    """Borra la carpeta de cache de tipos COM (gen_py) Y limpia las
-    referencias en memoria (sys.modules, registro interno de gencache).
-    Solo borrar el archivo en disco NO alcanza: dentro del mismo proceso,
-    Python ya dejo una referencia rota en sys.modules tras el primer
-    intento fallido, y EnsureDispatch la sigue usando aunque el archivo
-    ya no exista en disco -- por eso hay que limpiar tambien la memoria
-    antes de reintentar."""
-    import shutil
-    import importlib
+Write-Output "LOG:Leyendo parametros..."
+$paramsRaw = Get-Content -Raw -Path $ParamsJson
+$params = $paramsRaw | ConvertFrom-Json
 
-    # 1) Borrar del disco
-    if cache_dir and os.path.isdir(cache_dir):
-        try:
-            shutil.rmtree(cache_dir, ignore_errors=True)
-        except Exception:
-            pass
-        try:
-            os.makedirs(cache_dir, exist_ok=True)
-        except Exception:
-            pass
+$servidor = $params.server
+$tags = $params.tags
+$utcStart = [double]$params.start_utc_seconds
+$utcEnd = [double]$params.end_utc_seconds
 
-    # 2) Quitar del cache de modulos ya importados en este proceso
-    for nombre in list(sys.modules.keys()):
-        if nombre.startswith("win32com.gen_py"):
-            del sys.modules[nombre]
+Write-Output "LOG:Servidor: $servidor"
+Write-Output "LOG:Tags a extraer: $($tags.Count)"
 
-    # 3) Resetear el registro interno de gencache (que "recuerda" que
-    # ya genero/importo ese tipo, aunque haya fallado). Se hace atributo
-    # por atributo con try/except individual, por si alguno no existe
-    # en la version de pywin32 instalada (no debe tumbar el reintento).
-    for attr in ("dict", "dict_class_to_typelib", "clsidToPackageMap"):
-        try:
-            getattr(win32com.client.gencache, attr).clear()
-        except Exception:
-            pass
+try {
+    $piSDK = New-Object -ComObject "PISDK.PISDK"
+} catch {
+    Write-Output "LOG:ERROR: no se pudo crear el objeto PISDK.PISDK. Verifica que PI-SDK este instalado en esta maquina."
+    Write-Output "LOG:$($_.Exception.Message)"
+    exit 1
+}
 
-    # 4) Invalidar el cache de importacion de Python, para que vuelva
-    # a mirar el disco (con la carpeta ya vacia/regenerada) en vez de
-    # asumir que ya sabe que hay ahi
-    importlib.invalidate_caches()
+try {
+    $piServer = $piSDK.Servers.Item($servidor)
+} catch {
+    Write-Output "LOG:ERROR: no se pudo conectar al servidor '$servidor'."
+    Write-Output "LOG:$($_.Exception.Message)"
+    exit 1
+}
+
+$tsStart = New-Object -ComObject "PITimeServer.PITime"
+$tsEnd = New-Object -ComObject "PITimeServer.PITime"
+$tsStart.UTCSeconds = $utcStart
+$tsEnd.UTCSeconds = $utcEnd
+
+if (!(Test-Path $OutFolder)) { New-Item -ItemType Directory -Path $OutFolder | Out-Null }
+
+$i = 0
+$total = $tags.Count
+foreach ($tagRaw in $tags) {
+    $i++
+    $tag = Limpiar-NombreTag $tagRaw
+    $nombreSeguro = Limpiar-NombreArchivo $tag
+    Write-Output "PROGRESO:$i/$total"
+    Write-Output "LOG:[$i/$total] Extrayendo: $tag"
+
+    $piPoint = $null
+    try {
+        $piPoint = $piServer.PIPoints.Item($tag)
+    } catch {
+        $piPoint = $null
+    }
+
+    if ($null -eq $piPoint) {
+        $ruta = Join-Path $OutFolder "TAG${i}_${nombreSeguro}_0.csv"
+        $sw = New-Object System.IO.StreamWriter($ruta, $false, [System.Text.Encoding]::UTF8)
+        $sw.WriteLine("Timestamp,Valor,Tag")
+        $sw.WriteLine(",,`"TAG NO ENCONTRADO: $tag`"")
+        $sw.Close()
+        Write-Output "LOG:[$i/$total] $tag : TAG NO ENCONTRADO"
+        continue
+    }
+
+    $piValues = $null
+    try {
+        $piValues = $piPoint.Data.RecordedValues($tsStart, $tsEnd)
+    } catch {
+        $ruta = Join-Path $OutFolder "TAG${i}_${nombreSeguro}_0.csv"
+        $sw = New-Object System.IO.StreamWriter($ruta, $false, [System.Text.Encoding]::UTF8)
+        $sw.WriteLine("Timestamp,Valor,Tag")
+        $sw.WriteLine(",,`"ERROR: $($_.Exception.Message)`"")
+        $sw.Close()
+        Write-Output "LOG:[$i/$total] $tag : ERROR ($($_.Exception.Message))"
+        continue
+    }
+
+    $conteo = $piValues.Count
+    $ruta = Join-Path $OutFolder "TAG${i}_${nombreSeguro}_${conteo}.csv"
+
+    $sw = New-Object System.IO.StreamWriter($ruta, $false, [System.Text.Encoding]::UTF8)
+    $sw.WriteLine("Timestamp,Valor,Tag")
+    foreach ($v in $piValues) {
+        try {
+            $ts = [datetime]$v.TimeStamp.LocalDate
+            $tsStr = $ts.ToString("yyyy-MM-dd HH:mm:ss")
+            $sw.WriteLine("$tsStr,$($v.Value),`"$tag`"")
+        } catch {
+            # fila individual con dato raro -- se salta, no se aborta todo el tag
+            continue
+        }
+    }
+    $sw.Close()
+
+    Write-Output "LOG:[$i/$total] $tag : $conteo puntos exportados"
+}
+
+Write-Output "LOG:=== EXTRACCION COMPLETADA ==="
+'''
 
 
 class VentanaProgreso:
@@ -203,7 +264,6 @@ class VentanaProgreso:
         self.root.protocol("WM_DELETE_WINDOW", self._on_close_intentado)
 
     def _on_close_intentado(self):
-        # Evita que cierren la ventana a medias mientras esta trabajando
         if self.boton_cerrar["state"] == "normal":
             self.root.destroy()
 
@@ -219,8 +279,6 @@ class VentanaProgreso:
         self.root.update()
 
     def progreso(self, valor, maximo):
-        """Barra determinate: usar cuando se conoce el total de pasos
-        (ej. extrayendo tag i de N, o leyendo archivo i de N)."""
         if maximo <= 0:
             maximo = 1
         if self.progress["mode"] != "determinate":
@@ -234,9 +292,6 @@ class VentanaProgreso:
         self.root.update()
 
     def progreso_indeterminado(self, activar=True):
-        """Barra animada (va y viene): usar durante pasos sin un total
-        conocido de antemano, como el pivot_table de pandas (es
-        vectorizado y casi instantaneo, no tiene 'items' que contar)."""
         if activar:
             self.progress.config(mode="indeterminate")
             self.progress_pct_var.set("...")
@@ -263,16 +318,7 @@ def cargar_parametros(ruta_json):
         return json.load(f)
 
 
-def limpiar_nombre_tag(tag):
-    if "\\" in tag:
-        return tag.split("\\")[-1]
-    return tag
-
-
 def limpiar_nombre_para_archivo(nombre_tag):
-    """Reemplaza caracteres no permitidos en nombres de archivo de Windows
-    (los tags de PI suelen traer ':' -- ej. 'TANK:15J03YB52COD.LV' --
-    que NO es valido en un nombre de archivo)."""
     invalidos = [":", "\\", "/", "*", "?", '"', "<", ">", "|"]
     r = nombre_tag
     for ch in invalidos:
@@ -280,174 +326,78 @@ def limpiar_nombre_para_archivo(nombre_tag):
     return r
 
 
-def extraer_series(params, ui, carpeta_salida):
-    """Se conecta a PI y extrae cada tag. Ademas de devolver todo en
-    memoria para el combinado, escribe un CSV individual por tag
-    (formato TAGn_nombre_conteo.csv), igual que hacia la macro VBA."""
-    servidor_nombre = params["server"]
-    tags = params["tags"]
-    utc_start = params["start_utc_seconds"]
-    utc_end = params["end_utc_seconds"]
-
-    ui.log(f"Servidor: {servidor_nombre}")
-    ui.log(f"Tags a extraer: {len(tags)}")
-    ui.estado("Conectando a PI...")
-
-    # IMPORTANTE: usamos gencache.EnsureDispatch (enlace temprano) en vez de
-    # win32com.client.Dispatch (enlace tardio/generico) para PISDK y PITime.
-    # Con Dispatch generico, pasar un objeto COM (como ts_start/ts_end) como
-    # ARGUMENTO de otro metodo COM (RecordedValues) a veces falla con
-    # "The Python instance can not be converted to a COM object", porque el
-    # wrapper generico no conoce la firma exacta del metodo. EnsureDispatch
-    # genera un wrapper con la definicion real del tipo (equivalente a usar
-    # "Dim x As PISDK.PISDK" en VBA en vez de "CreateObject"), lo que
-    # resuelve el problema de raiz.
-    #
-    # Si la cache de tipos (gen_py) quedo corrupta/desincronizada (ej. tras
-    # actualizar el .exe), EnsureDispatch falla con "No module named
-    # win32com.gen_py.<CLSID>...". En ese caso se borra la cache y se
-    # reintenta UNA vez, regenerandola desde cero automaticamente, sin que
-    # el usuario tenga que borrar nada a mano en %TEMP%.
-    pisdk = None
-    for intento in range(2):
-        try:
-            pisdk = win32com.client.gencache.EnsureDispatch("PISDK.PISDK")
-            break
-        except Exception as e:
-            es_error_cache = "gen_py" in str(e) or "No module named" in str(e)
-            if intento == 0 and es_error_cache:
-                ui.log("Cache de COM desactualizada, regenerando automaticamente...")
-                _limpiar_cache_com(_cache_com_dir)
-                continue
-            ui.log(f"ERROR con EnsureDispatch (enlace temprano): {e}")
-            break
-
-    if pisdk is None:
-        # Ultimo recurso: enlace tardio comun. No es ideal (el motivo por
-        # el que se uso gencache fue evitar "The Python instance can not
-        # be converted to a COM object" al pasar ts_start/ts_end como
-        # argumentos), pero es mejor intentarlo que fallar por completo
-        # si el mecanismo de gencache no funciona en este build del .exe.
-        ui.log("Reintentando con enlace tardio (Dispatch normal) como ultimo recurso...")
-        try:
-            pisdk = win32com.client.Dispatch("PISDK.PISDK")
-        except Exception as e:
-            ui.log(f"ERROR: no se pudo crear el objeto PISDK.PISDK de ninguna forma. "
-                   f"Verifica que PI-SDK este instalado en esta maquina.\n{e}")
-            return []
-
+def extraer_via_powershell(ruta_json, carpeta_salida, ui):
+    """Escribe el script de PowerShell embebido a un archivo temporal
+    y lo ejecuta, leyendo su salida linea por linea para actualizar
+    el log y la barra de progreso en vivo. La extraccion real de PI
+    ocurre DENTRO del proceso de PowerShell (COM nativo de Windows,
+    igual que hacia la macro VBA) -- Python solo orquesta y muestra
+    el avance, sin tocar COM para nada."""
+    fd, ruta_ps1 = tempfile.mkstemp(suffix=".ps1", prefix="abspiexcelextract_")
     try:
-        server = pisdk.Servers(servidor_nombre)
-    except Exception as e:
-        ui.log(f"ERROR: no se pudo conectar al servidor '{servidor_nombre}'.\n{e}")
-        return []
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(_POWERSHELL_SCRIPT)
 
-    ts_start = ts_end = None
-    for intento in range(2):
-        try:
-            ts_start = win32com.client.gencache.EnsureDispatch("PITimeServer.PITime")
-            ts_end = win32com.client.gencache.EnsureDispatch("PITimeServer.PITime")
-            break
-        except Exception as e:
-            es_error_cache = "gen_py" in str(e) or "No module named" in str(e)
-            if intento == 0 and es_error_cache:
-                ui.log("Cache de COM desactualizada (PITime), regenerando automaticamente...")
-                _limpiar_cache_com(_cache_com_dir)
+        cmd = [
+            "powershell.exe",
+            "-NoProfile",
+            "-ExecutionPolicy", "Bypass",
+            "-File", ruta_ps1,
+            "-ParamsJson", ruta_json,
+            "-OutFolder", carpeta_salida,
+        ]
+
+        ui.estado("Conectando a PI (via PowerShell)...")
+
+        proceso = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+            creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0,
+        )
+
+        patron_progreso = re.compile(r"^PROGRESO:(\d+)/(\d+)$")
+
+        for linea in proceso.stdout:
+            linea = linea.rstrip("\n").rstrip("\r")
+            if not linea:
                 continue
-            ui.log(f"ERROR con EnsureDispatch para PITime: {e}")
-            break
 
-    if ts_start is None or ts_end is None:
-        ui.log("Reintentando PITime con enlace tardio (Dispatch normal) como ultimo recurso...")
+            m = patron_progreso.match(linea)
+            if m:
+                actual, total = int(m.group(1)), int(m.group(2))
+                ui.progreso(actual, total)
+                continue
+
+            if linea.startswith("LOG:"):
+                mensaje = linea[4:]
+                ui.log(mensaje)
+                if mensaje.startswith("[") and "Extrayendo:" in mensaje:
+                    ui.estado(mensaje.lstrip("LOG:"))
+                continue
+
+            # cualquier otra linea (por si PowerShell escribe algo inesperado)
+            ui.log(linea)
+
+        proceso.wait()
+
+        if proceso.returncode != 0:
+            ui.log(f"\nEl proceso de extraccion (PowerShell) termino con codigo {proceso.returncode}.")
+
+    finally:
         try:
-            ts_start = win32com.client.Dispatch("PITimeServer.PITime")
-            ts_end = win32com.client.Dispatch("PITimeServer.PITime")
-        except Exception as e:
-            ui.log(f"ERROR: no se pudo crear el objeto PITimeServer.PITime de ninguna forma.\n{e}")
-            return []
-
-    ts_start.UTCSeconds = utc_start
-    ts_end.UTCSeconds = utc_end
-
-    series = []
-    ui.log("\n=== Extrayendo trazas ===")
-    ui.progreso(0, len(tags))
-    for i, tag_raw in enumerate(tags, start=1):
-        tag = limpiar_nombre_tag(tag_raw)
-        ui.estado(f"Extrayendo {i}/{len(tags)}: {tag}")
-        nombre_archivo_seguro = limpiar_nombre_para_archivo(tag)
-
-        try:
-            point = server.PIPoints(tag)
+            os.remove(ruta_ps1)
         except Exception:
-            ui.log(f"[{i}/{len(tags)}] {tag}: TAG NO ENCONTRADO -- se omite")
-            _escribir_csv_individual(carpeta_salida, i, nombre_archivo_seguro, 0,
-                                      filas_error=[("", "", f"TAG NO ENCONTRADO: {tag}")])
-            ui.progreso(i, len(tags))
-            continue
-
-        try:
-            values = point.Data.RecordedValues(ts_start, ts_end)
-        except Exception as e:
-            ui.log(f"[{i}/{len(tags)}] {tag}: ERROR ({e}) -- se omite")
-            _escribir_csv_individual(carpeta_salida, i, nombre_archivo_seguro, 0,
-                                      filas_error=[("", "", f"ERROR: {e}")])
-            ui.progreso(i, len(tags))
-            continue
-
-        puntos = []
-        for v in values:
-            try:
-                ts_local = datetime.strptime(str(v.TimeStamp.LocalDate), "%m/%d/%Y %I:%M:%S %p")
-            except ValueError:
-                try:
-                    ts_local = pd.to_datetime(str(v.TimeStamp.LocalDate))
-                except Exception:
-                    continue
-            try:
-                val = float(v.Value)
-            except (TypeError, ValueError):
-                continue
-            puntos.append((ts_local, val))
-
-        ui.log(f"[{i}/{len(tags)}] {tag}: {len(puntos)} puntos")
-
-        # CSV individual de esta traza, con el conteo real ya en el nombre
-        _escribir_csv_individual(carpeta_salida, i, nombre_archivo_seguro, len(puntos),
-                                  puntos=puntos, tag_completo=tag)
-
-        if puntos:
-            series.append((tag, puntos))
-
-        ui.progreso(i, len(tags))
-
-    return series
-
-
-def _escribir_csv_individual(carpeta_salida, indice, nombre_archivo_seguro, conteo,
-                              puntos=None, tag_completo="", filas_error=None):
-    """Escribe el CSV individual de una traza: TAGn_nombre_conteo.csv
-    Mismo formato/contenido que generaba la macro VBA (columnas
-    Timestamp,Valor,Tag), asi los archivos siguen siendo compatibles
-    con cualquier otra herramienta que ya espere ese formato."""
-    nombre = f"TAG{indice}_{nombre_archivo_seguro}_{conteo}.csv"
-    ruta = os.path.join(carpeta_salida, nombre)
-    with open(ruta, "w", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        writer.writerow(["Timestamp", "Valor", "Tag"])
-        if filas_error:
-            for fila in filas_error:
-                writer.writerow(fila)
-        elif puntos:
-            for ts, val in puntos:
-                writer.writerow([ts.strftime("%Y-%m-%d %H:%M:%S"), val, tag_completo])
+            pass
 
 
 def leer_csv_individual(ruta_csv):
     """Lee un CSV individual (formato Timestamp,Valor,Tag) generado
-    por este mismo programa o por la macro VBA. Devuelve (tag, puntos)
-    o (None, []) si el archivo no tiene datos utilizables (tag no
-    encontrado, error, o vacio)."""
+    por el script de PowerShell o por la macro VBA. Devuelve (tag,
+    puntos), con puntos vacio si el archivo no tiene datos utilizables
+    (tag no encontrado, error, o vacio)."""
     tag = os.path.splitext(os.path.basename(ruta_csv))[0]
     puntos = []
     tag_real = None
@@ -456,7 +406,7 @@ def leer_csv_individual(ruta_csv):
 
     with open(ruta_csv, "r", encoding="utf-8-sig", errors="ignore") as f:
         reader = csv.reader(f)
-        header = next(reader, None)
+        next(reader, None)  # encabezado
         for row in reader:
             if len(row) < 2:
                 continue
@@ -496,9 +446,10 @@ def leer_csv_individual(ruta_csv):
 def combinar_desde_carpeta(carpeta, ui):
     """Modo 'solo combinar': lee todos los CSV individuales (formato
     TAGn_nombre_conteo.csv, o cualquier CSV con columnas
-    Timestamp,Valor,Tag) que ya existan en una carpeta, y arma el
-    combinado -- sin tocar PI para nada. Devuelve la lista 'series'
-    en el mismo formato que usa combinar_series()."""
+    Timestamp,Valor,Tag) que ya existan en una carpeta, y arma la
+    lista 'series' que espera combinar_series(). Tambien se usa
+    despues del modo 'extraer', para leer los CSV que escribio el
+    script de PowerShell."""
     archivos = [f for f in os.listdir(carpeta)
                 if f.lower().endswith(".csv") and not f.lower().startswith("combinado")]
 
@@ -506,7 +457,7 @@ def combinar_desde_carpeta(carpeta, ui):
         ui.log("No se encontraron archivos CSV en la carpeta.")
         return []
 
-    ui.log(f"Encontrados {len(archivos)} archivos CSV en la carpeta.\n")
+    ui.log(f"\nLeyendo {len(archivos)} archivos CSV para combinar...\n")
 
     series = []
     ui.progreso(0, len(archivos))
@@ -514,7 +465,6 @@ def combinar_desde_carpeta(carpeta, ui):
         ruta = os.path.join(carpeta, nombre)
         ui.estado(f"Leyendo {i}/{len(archivos)}: {nombre}")
         tag, puntos = leer_csv_individual(ruta)
-        ui.log(f"[{i}/{len(archivos)}] {nombre} -> tag='{tag}', {len(puntos)} puntos")
         if puntos:
             series.append((tag, puntos))
         ui.progreso(i, len(archivos))
@@ -533,7 +483,6 @@ def combinar_series(series, ui):
         ui.log("No hay series validas para combinar.")
         return None
 
-    # --- Armar la tabla larga: progreso determinate (se conoce el total de puntos) ---
     total_puntos = sum(len(puntos) for _, puntos in series)
     filas_largo = []
     procesados = 0
@@ -545,8 +494,6 @@ def combinar_series(series, ui):
             procesados += 1
         ui.progreso(procesados, total_puntos)
 
-    # --- Pivot/alineacion: operacion vectorizada de pandas, sin pasos
-    # individuales que mostrar -> barra animada (indeterminate) ---
     ui.estado("Combinando series: alineando por tiempo...")
     ui.progreso_indeterminado(True)
 
@@ -557,7 +504,7 @@ def combinar_series(series, ui):
 
     pivot = df.pivot_table(index="Timestamp", columns="Tag", values="Valor", aggfunc="last")
     pivot = pivot.sort_index()
-    pivot = pivot.ffill().bfill()  # PI-style: mantener ultimo valor real; backfill solo al inicio
+    pivot = pivot.ffill().bfill()
 
     resultado = pivot.reset_index()
     resultado.columns.name = None
@@ -572,19 +519,10 @@ def combinar_series(series, ui):
 
 def trabajo_principal(ui, modo, ruta_entrada, carpeta_salida):
     """Corre en un hilo aparte para no congelar la ventana.
-    modo = 'extraer' (ruta_entrada es un JSON de parametros: se
-           conecta a PI, extrae, y combina) o
+    modo = 'extraer' (ruta_entrada es un JSON de parametros: lanza
+           PowerShell para extraer de PI, y luego combina) o
            'combinar' (ruta_entrada es una carpeta con CSV ya
-           existentes: solo los lee y combina, sin tocar PI).
-    IMPORTANTE: los objetos COM (PISDK, PITimeServer) requieren que
-    el hilo donde se usan tenga COM inicializado -- por default solo
-    el hilo principal lo tiene. Como esta funcion corre en un
-    threading.Thread aparte, hay que inicializar COM aqui mismo con
-    pythoncom.CoInitialize() antes de crear cualquier objeto COM, y
-    liberarlo con CoUninitialize() al terminar. En modo 'combinar'
-    no hace falta COM en absoluto (no se toca PI), pero se inicializa
-    igual por si acaso alguna libreria lo requiere de forma indirecta."""
-    com_inicializado = False
+           existentes: solo los lee y combina, sin tocar PI)."""
     try:
         if pd is None:
             ui.log("ERROR: falta pandas en este build.")
@@ -592,16 +530,8 @@ def trabajo_principal(ui, modo, ruta_entrada, carpeta_salida):
             return
 
         if modo == "extraer":
-            if win32com is None:
-                ui.log("ERROR: falta pywin32 en este build.")
-                ui.terminar(exito=False)
-                return
-
-            pythoncom.CoInitialize()
-            com_inicializado = True
-
-            params = cargar_parametros(ruta_entrada)
-            series = extraer_series(params, ui, carpeta_salida)
+            extraer_via_powershell(ruta_entrada, carpeta_salida, ui)
+            series = combinar_desde_carpeta(carpeta_salida, ui)
         else:  # modo == "combinar"
             series = combinar_desde_carpeta(ruta_entrada, ui)
 
@@ -632,18 +562,11 @@ def trabajo_principal(ui, modo, ruta_entrada, carpeta_salida):
     except Exception as e:
         ui.log(f"\nERROR INESPERADO: {e}")
         ui.terminar(exito=False)
-    finally:
-        if com_inicializado:
-            pythoncom.CoUninitialize()
 
 
 def elegir_entrada_con_dialogo():
     """Se muestra solo cuando el .exe se abre con doble clic (sin
-    argumentos de linea de comandos). Pregunta si el usuario quiere
-    trabajar desde un archivo JSON de parametros (extrae de PI y
-    combina) o desde una carpeta con CSV ya existentes (solo combina).
-    Devuelve (modo, ruta_entrada, carpeta_salida) o (None, None, None)
-    si el usuario cancela."""
+    argumentos de linea de comandos)."""
     from tkinter import filedialog
 
     root = tk.Tk()
@@ -682,15 +605,7 @@ def elegir_entrada_con_dialogo():
 
 
 def main():
-    global _cache_com_dir
-    _cache_com_dir = _preparar_cache_com()
-
     if len(sys.argv) >= 2:
-        # Modo linea de comandos (lanzado desde VBA, o manual con argumentos).
-        # El primer argumento puede ser:
-        #   - un archivo .json de parametros -> modo "extraer" (PI + combina)
-        #   - una carpeta con CSV ya existentes -> modo "combinar" (sin PI)
-        # Se detecta automaticamente segun que es (archivo vs carpeta).
         ruta_entrada = sys.argv[1]
 
         if os.path.isdir(ruta_entrada):
@@ -706,10 +621,9 @@ def main():
                                   f"No se encontro el archivo ni la carpeta:\n{ruta_entrada}")
             sys.exit(1)
     else:
-        # Doble clic sin argumentos: preguntar que quiere hacer
         modo, ruta_entrada, carpeta_salida = elegir_entrada_con_dialogo()
         if modo is None:
-            sys.exit(0)  # el usuario cancelo, salir sin error
+            sys.exit(0)
 
     os.makedirs(carpeta_salida, exist_ok=True)
 
