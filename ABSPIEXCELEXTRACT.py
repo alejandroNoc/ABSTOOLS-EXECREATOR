@@ -13,6 +13,13 @@ A partir de un archivo de parametros JSON generado por la macro VBA
      de Excel/Python (pivot por Tag, sin inventar fechas).
   4. Escribe un unico CSV combinado, listo para usar.
 
+Si se abre con DOBLE CLIC (sin argumentos de linea de comandos),
+pregunta si se quiere:
+  - Abrir un archivo de parametros .json (extrae de PI y combina), o
+  - Abrir una carpeta con CSV ya existentes (solo combina, sin PI --
+    util si ya se habian extraido los tags en otra corrida y solo
+    hace falta rearmar el combinado).
+
 Muestra una ventanita de progreso (Tkinter) con el avance en vivo,
 para poder compilarse con --noconsole y aun asi ver que esta pasando.
 
@@ -28,7 +35,10 @@ Este .exe debe quedar instalado en: C:\\ABSTOOLS\\ABSPIEXCELEXTRACT.exe
 (esa es la ruta que espera el modulo VBA "GenerarParametrosExtraccion"
 si el usuario elige lanzarlo automaticamente desde ProcessBook).
 
-Uso manual (una vez compilado):
+Uso con doble clic: se abre el dialogo de seleccion descrito arriba.
+
+Uso por linea de comandos (igual que antes, para el lanzamiento
+automatico desde VBA):
     ABSPIEXCELEXTRACT.exe parametros_extraccion_XXXX.json [carpeta_salida]
 """
 import sys
@@ -263,6 +273,83 @@ def _escribir_csv_individual(carpeta_salida, indice, nombre_archivo_seguro, cont
                 writer.writerow([ts.strftime("%Y-%m-%d %H:%M:%S"), val, tag_completo])
 
 
+def leer_csv_individual(ruta_csv):
+    """Lee un CSV individual (formato Timestamp,Valor,Tag) generado
+    por este mismo programa o por la macro VBA. Devuelve (tag, puntos)
+    o (None, []) si el archivo no tiene datos utilizables (tag no
+    encontrado, error, o vacio)."""
+    tag = os.path.splitext(os.path.basename(ruta_csv))[0]
+    puntos = []
+    tag_real = None
+
+    formatos = ["%Y-%m-%d %H:%M:%S", "%m/%d/%Y %I:%M:%S %p", "%d/%m/%Y %H:%M:%S"]
+
+    with open(ruta_csv, "r", encoding="utf-8-sig", errors="ignore") as f:
+        reader = csv.reader(f)
+        header = next(reader, None)
+        for row in reader:
+            if len(row) < 2:
+                continue
+            ts_raw, val_raw = row[0].strip(), row[1].strip()
+            if not ts_raw or not val_raw:
+                continue
+
+            ts_local = None
+            for fmt in formatos:
+                try:
+                    ts_local = datetime.strptime(ts_raw, fmt)
+                    break
+                except ValueError:
+                    continue
+            if ts_local is None and pd is not None:
+                try:
+                    ts_local = pd.to_datetime(ts_raw)
+                except Exception:
+                    continue
+            if ts_local is None:
+                continue
+
+            try:
+                val = float(val_raw)
+            except ValueError:
+                continue
+
+            puntos.append((ts_local, val))
+            if len(row) >= 3 and row[2].strip():
+                tag_real = row[2].strip().strip('"')
+
+    if tag_real:
+        tag = tag_real
+    return tag, puntos
+
+
+def combinar_desde_carpeta(carpeta, ui):
+    """Modo 'solo combinar': lee todos los CSV individuales (formato
+    TAGn_nombre_conteo.csv, o cualquier CSV con columnas
+    Timestamp,Valor,Tag) que ya existan en una carpeta, y arma el
+    combinado -- sin tocar PI para nada. Devuelve la lista 'series'
+    en el mismo formato que usa combinar_series()."""
+    archivos = [f for f in os.listdir(carpeta)
+                if f.lower().endswith(".csv") and not f.lower().startswith("combinado")]
+
+    if not archivos:
+        ui.log("No se encontraron archivos CSV en la carpeta.")
+        return []
+
+    ui.log(f"Encontrados {len(archivos)} archivos CSV en la carpeta.\n")
+
+    series = []
+    for i, nombre in enumerate(sorted(archivos), start=1):
+        ruta = os.path.join(carpeta, nombre)
+        ui.estado(f"Leyendo {i}/{len(archivos)}: {nombre}")
+        tag, puntos = leer_csv_individual(ruta)
+        ui.log(f"[{i}/{len(archivos)}] {nombre} -> tag='{tag}', {len(puntos)} puntos")
+        if puntos:
+            series.append((tag, puntos))
+
+    return series
+
+
 def combinar_series(series, ui):
     """Combina las series extraidas en una sola tabla, alineando
     por 'ultimo valor real conocido' (igual que PI Trend), con
@@ -297,35 +384,47 @@ def combinar_series(series, ui):
     return resultado
 
 
-def trabajo_principal(ui, ruta_json, carpeta_salida):
+def trabajo_principal(ui, modo, ruta_entrada, carpeta_salida):
     """Corre en un hilo aparte para no congelar la ventana.
+    modo = 'extraer' (ruta_entrada es un JSON de parametros: se
+           conecta a PI, extrae, y combina) o
+           'combinar' (ruta_entrada es una carpeta con CSV ya
+           existentes: solo los lee y combina, sin tocar PI).
     IMPORTANTE: los objetos COM (PISDK, PITimeServer) requieren que
     el hilo donde se usan tenga COM inicializado -- por default solo
     el hilo principal lo tiene. Como esta funcion corre en un
     threading.Thread aparte, hay que inicializar COM aqui mismo con
     pythoncom.CoInitialize() antes de crear cualquier objeto COM, y
-    liberarlo con CoUninitialize() al terminar."""
+    liberarlo con CoUninitialize() al terminar. En modo 'combinar'
+    no hace falta COM en absoluto (no se toca PI), pero se inicializa
+    igual por si acaso alguna libreria lo requiere de forma indirecta."""
     com_inicializado = False
     try:
-        if win32com is None:
-            ui.log("ERROR: falta pywin32 en este build.")
-            ui.terminar(exito=False)
-            return
         if pd is None:
             ui.log("ERROR: falta pandas en este build.")
             ui.terminar(exito=False)
             return
 
-        pythoncom.CoInitialize()
-        com_inicializado = True
+        if modo == "extraer":
+            if win32com is None:
+                ui.log("ERROR: falta pywin32 en este build.")
+                ui.terminar(exito=False)
+                return
 
-        params = cargar_parametros(ruta_json)
-        series = extraer_series(params, ui, carpeta_salida)
+            pythoncom.CoInitialize()
+            com_inicializado = True
+
+            params = cargar_parametros(ruta_entrada)
+            series = extraer_series(params, ui, carpeta_salida)
+        else:  # modo == "combinar"
+            series = combinar_desde_carpeta(ruta_entrada, ui)
+
         resultado = combinar_series(series, ui)
 
         if resultado is None:
             ui.log("No se genero ningun archivo combinado (sin datos validos).")
-            ui.log(f"Revisa los CSV individuales por tag en: {carpeta_salida}")
+            if modo == "extraer":
+                ui.log(f"Revisa los CSV individuales por tag en: {carpeta_salida}")
             ui.terminar(exito=False)
             return
 
@@ -334,7 +433,8 @@ def trabajo_principal(ui, ruta_json, carpeta_salida):
         resultado.to_csv(ruta_salida, index=False, encoding="utf-8")
 
         ui.log(f"\n=== LISTO ===")
-        ui.log(f"CSV individuales por tag: {carpeta_salida}")
+        if modo == "extraer":
+            ui.log(f"CSV individuales por tag: {carpeta_salida}")
         ui.log(f"Archivo combinado: {ruta_salida}")
         ui.terminar(exito=True)
 
@@ -351,31 +451,75 @@ def trabajo_principal(ui, ruta_json, carpeta_salida):
             pythoncom.CoUninitialize()
 
 
+def elegir_entrada_con_dialogo():
+    """Se muestra solo cuando el .exe se abre con doble clic (sin
+    argumentos de linea de comandos). Pregunta si el usuario quiere
+    trabajar desde un archivo JSON de parametros (extrae de PI y
+    combina) o desde una carpeta con CSV ya existentes (solo combina).
+    Devuelve (modo, ruta_entrada, carpeta_salida) o (None, None, None)
+    si el usuario cancela."""
+    from tkinter import filedialog
+
+    root = tk.Tk()
+    root.withdraw()
+
+    opcion = messagebox.askyesnocancel(
+        "ABSPIEXCELEXTRACT",
+        "Que queres hacer?\n\n"
+        "SI = Abrir un archivo de parametros (.json) -> extrae de PI y combina\n"
+        "NO = Abrir una carpeta con CSV ya existentes -> solo combina\n"
+        "CANCELAR = Salir"
+    )
+
+    if opcion is None:
+        root.destroy()
+        return None, None, None
+
+    if opcion:  # Si -> JSON
+        ruta_json = filedialog.askopenfilename(
+            title="Selecciona el archivo de parametros (.json)",
+            filetypes=[("Archivos JSON", "*.json"), ("Todos los archivos", "*.*")]
+        )
+        root.destroy()
+        if not ruta_json:
+            return None, None, None
+        carpeta_salida = os.path.dirname(os.path.abspath(ruta_json))
+        return "extraer", ruta_json, carpeta_salida
+    else:  # No -> carpeta con CSV
+        carpeta = filedialog.askdirectory(
+            title="Selecciona la carpeta con los CSV ya extraidos"
+        )
+        root.destroy()
+        if not carpeta:
+            return None, None, None
+        return "combinar", carpeta, carpeta
+
+
 def main():
     _preparar_cache_com()
 
-    if len(sys.argv) < 2:
-        root = tk.Tk()
-        root.withdraw()
-        messagebox.showerror(
-            "ABSPIEXCELEXTRACT",
-            "Uso: ABSPIEXCELEXTRACT.exe <archivo_parametros.json> [carpeta_salida]"
-        )
-        sys.exit(1)
+    if len(sys.argv) >= 2:
+        # Modo linea de comandos (lanzado desde VBA, o manual con argumentos).
+        # Se sigue aceptando SOLO un archivo .json, como antes.
+        ruta_entrada = sys.argv[1]
+        if not os.path.isfile(ruta_entrada):
+            root = tk.Tk()
+            root.withdraw()
+            messagebox.showerror("ABSPIEXCELEXTRACT", f"No se encontro el archivo:\n{ruta_entrada}")
+            sys.exit(1)
+        modo = "extraer"
+        carpeta_salida = sys.argv[2] if len(sys.argv) > 2 else os.path.dirname(os.path.abspath(ruta_entrada))
+    else:
+        # Doble clic sin argumentos: preguntar que quiere hacer
+        modo, ruta_entrada, carpeta_salida = elegir_entrada_con_dialogo()
+        if modo is None:
+            sys.exit(0)  # el usuario cancelo, salir sin error
 
-    ruta_json = sys.argv[1]
-    if not os.path.isfile(ruta_json):
-        root = tk.Tk()
-        root.withdraw()
-        messagebox.showerror("ABSPIEXCELEXTRACT", f"No se encontro el archivo:\n{ruta_json}")
-        sys.exit(1)
-
-    carpeta_salida = sys.argv[2] if len(sys.argv) > 2 else os.path.dirname(os.path.abspath(ruta_json))
     os.makedirs(carpeta_salida, exist_ok=True)
 
     ui = VentanaProgreso()
 
-    hilo = threading.Thread(target=trabajo_principal, args=(ui, ruta_json, carpeta_salida), daemon=True)
+    hilo = threading.Thread(target=trabajo_principal, args=(ui, modo, ruta_entrada, carpeta_salida), daemon=True)
     hilo.start()
 
     ui.iniciar_loop()
